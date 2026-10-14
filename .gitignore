@@ -1,0 +1,19 @@
+# Python virtual environment & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Runtime storage (uploaded & exported temporary documents)
+storage/uploads/*
+storage/outputs/*
+!storage/uploads/.gitkeep
+!storage/outputs/.gitkeep
+
+# macOS & IDE
+.DS_Store
+.vscode/
+.idea/
+*.tmp

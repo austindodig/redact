@@ -1,0 +1,42 @@
+================================================================================
+FEDERAL GENERAL SERVICES ADMINISTRATION (GSA) — FOIA RELEASE CANDIDATE
+DOCUMENT ID: GSA-FOIA-2026-09912  |  CLASSIFICATION: UNCLASSIFIED // CUI
+================================================================================
+
+FROM:      Director Margaret A. Sullivan
+EMAIL:     margaret.sullivan@gsa.gov
+PHONE:     (202) 555-0104 / Mobile: (571) 555-0122
+TO:        FOIA Public Liaison Officer Arthur D. Pendelton (arthur.pendelton@gsa.gov)
+DATE:      October 12, 2026
+SUBJECT:   Citizen Correspondence & Personnel Roster Review for FOIA Request #2026-00419
+
+--------------------------------------------------------------------------------
+1. CITIZEN REQUESTER & THIRD-PARTY PRIVACY SUMMARY
+--------------------------------------------------------------------------------
+The underlying administrative record contains third-party personally identifiable
+information (PII) that must be withheld pursuant to 5 U.S.C. § 552(b)(6) prior to
+public disclosure:
+
+  * Field Inspector: Mr. Gabriel L. Morales
+    - Direct Office Phone: (415) 555-0168 ext. 204
+    - Personal Cell Phone: 650-555-0194
+    - Official Email: gabriel.morales@gsa.gov
+    - Personal Email: gmorales.sf@gmail.com
+    - Social Security Number: 548-31-8820
+    - Home Address: 845 Market Street, Apt 902, San Francisco, CA 94103
+
+  * External Whistleblower / Witness: Ms. Clara E. Lindstrom
+    - Telephone: +1-206-555-0139
+    - Email Address: clara.lindstrom@northwest-audits.com
+    - Badge ID: Badge #GSA-773190
+
+  * Reviewing Supervisor: Col. Harrison W. Vance
+    - Military DSN: DSN 421-8890  |  Commercial: (703) 555-0118
+    - Email: harrison.w.vance.mil@mail.mil
+
+--------------------------------------------------------------------------------
+2. DETERMINATION
+--------------------------------------------------------------------------------
+Please ensure all names, phone numbers, email addresses, SSNs, badge IDs, and
+residential addresses above are completely excised from the final release file
+and logged in the accompanying Vaughn Index under FOIA Exemption (b)(6).

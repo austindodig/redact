@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Federal FOIA Redaction Workbench — Offline PII & Exemption System</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <!-- TOP FEDERAL CLASSIFICATION / OFFLINE STATUS BANNER -->
+  <div class="gov-banner">
+    <div class="gov-banner-left">
+      <span class="gov-seal">★ U.S. FEDERAL FOIA WORKBENCH</span>
+      <span class="gov-divider">|</span>
+      <span>5 U.S.C. § 552 Compliance &amp; Physical Content-Stream Sanitization</span>
+    </div>
+    <div class="gov-banner-right">
+      <span class="airgap-pill" title="Zero external API or network dependencies. All NLP & PDF sanitization executes locally.">
+        <span class="pulse-dot"></span> 100% OFFLINE / AIR-GAPPED ENGINE
+      </span>
+      <span id="engine-badge" class="engine-pill">Presidio + spaCy + PyMuPDF</span>
+    </div>
+  </div>
+
+  <!-- MAIN APPLICATION HEADER -->
+  <header class="app-header">
+    <div class="brand-group">
+      <div class="brand-icon">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+          <path d="M9 12l2 2 4-4"/>
+        </svg>
+      </div>
+      <div>
+        <h1>FOIA Redaction &amp; Vaughn Index Workbench</h1>
+        <p class="subtitle">Offline Automated Detection for Names, Phone Numbers, Email Addresses &amp; Federal Identifiers</p>
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <label for="file-upload-input" class="btn btn-secondary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        Upload Document or Scan (.PDF, .PNG, .TIFF, .JPG, .DOCX, .TXT)
+      </label>
+      <input id="file-upload-input" type="file" accept=".pdf,.docx,.txt,.md,.csv,.log,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp" hidden />
+
+      <div class="sample-dropdown-wrap">
+        <select id="sample-doc-select" class="select-control" aria-label="Load Federal Sample Document">
+          <option value="">Load Sample Federal Record...</option>
+        </select>
+      </div>
+
+      <button id="btn-finalize-export" class="btn btn-primary" disabled>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+        Burn Redactions &amp; Export Package
+      </button>
+    </div>
+  </header>
+
+  <!-- WORKSPACE THREE-PANE LAYOUT -->
+  <main class="workbench-grid">
+    <!-- LEFT PANEL: DETECTION CONFIGURATION & MANUAL REDACTION TOOLS -->
+    <aside class="panel panel-left">
+      <div class="panel-section">
+        <div class="section-header">
+          <h2>1. PII &amp; Entity Detectors</h2>
+          <span class="badge-tag">Focus: Names, Phones, Emails</span>
+        </div>
+        <p class="helper-text">Select target categories and default FOIA statutory exemptions before running or re-running detection.</p>
+
+        <div id="detector-toggles-list" class="detector-list">
+          <!-- Populated by app.js -->
+        </div>
+
+        <div class="confidence-row">
+          <div class="confidence-label-row">
+            <label for="confidence-slider">NER Sensitivity Threshold</label>
+            <span id="confidence-val">0.45</span>
+          </div>
+          <input id="confidence-slider" type="range" min="0.20" max="0.90" step="0.05" value="0.45" />
+        </div>
+
+        <button id="btn-reanalyze" class="btn btn-outline btn-full" disabled>
+          Re-Run Offline Detection Engine
+        </button>
+        <button id="btn-force-ocr" class="btn btn-secondary btn-full" style="margin-top:6px" title="Force local Tesseract OCR across all pages of the current PDF/Scan" disabled>
+          🔍 Force Full-Page Tesseract OCR
+        </button>
+      </div>
+
+      <div class="panel-section">
+        <div class="section-header">
+          <h2>2. Add Missed Redaction</h2>
+          <span class="badge-tag badge-manual">Manual Override</span>
+        </div>
+        <p class="helper-text">
+          Highlight text directly in the viewer, draw a box on any PDF page, or enter a custom name/term below to redact across the document:
+        </p>
+
+        <form id="manual-text-form" class="manual-form">
+          <div class="form-group">
+            <label for="manual-text-input">Exact Text, Name, Phone, or Phrase</label>
+            <input id="manual-text-input" type="text" placeholder="e.g., Evelyn M. Vance or (202) 555-0184" required />
+          </div>
+
+          <div class="form-row-2">
+            <div class="form-group">
+              <label for="manual-entity-select">Category</label>
+              <select id="manual-entity-select" class="select-control">
+                <option value="PERSON">Person / Name</option>
+                <option value="PHONE_NUMBER">Phone Number</option>
+                <option value="EMAIL_ADDRESS">Email Address</option>
+                <option value="US_SSN">Social Security #</option>
+                <option value="EMPLOYEE_ID">Badge / Employee ID</option>
+                <option value="STREET_ADDRESS">Street Address</option>
+                <option value="CUSTOM">Custom / Other</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label for="manual-exemption-select">FOIA Exemption</label>
+              <select id="manual-exemption-select" class="select-control">
+                <!-- Populated by app.js -->
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="manual-comment-input">Vaughn Index Justification Note (Optional)</label>
+            <input id="manual-comment-input" type="text" placeholder="e.g., Third-party witness personal identity" />
+          </div>
+
+          <label class="checkbox-inline">
+            <input id="manual-all-occurrences" type="checkbox" checked />
+            <span>Redact all occurrences in document</span>
+          </label>
+
+          <button type="submit" id="btn-add-manual-text" class="btn btn-secondary btn-full" disabled>
+            + Add Redaction &amp; Cite Exemption
+          </button>
+        </form>
+      </div>
+
+      <div class="panel-section">
+        <div class="section-header">
+          <h2>3. FOIA Statutory Reference</h2>
+        </div>
+        <div id="exemption-reference-cards" class="exemption-ref-list">
+          <!-- Populated by app.js -->
+        </div>
+      </div>
+    </aside>
+
+    <!-- CENTER PANEL: INTERACTIVE DOCUMENT VIEWER & CANVAS EDITOR -->
+    <section class="panel panel-center">
+      <!-- Viewer Toolbar -->
+      <div class="viewer-toolbar">
+        <div class="view-tabs" role="tablist">
+          <button id="tab-visual-pdf" class="view-tab active" data-view="visual">
+            Visual Page &amp; Box Editor
+          </button>
+          <button id="tab-interactive-text" class="view-tab" data-view="text">
+            Interactive Text &amp; Highlight Editor
+          </button>
+          <button id="tab-burned-preview" class="view-tab" data-view="burned">
+            Final Sanitized Preview (Irreversible Output)
+          </button>
+          <button id="tab-vaughn-index" class="view-tab" data-view="vaughn">
+            FOIA Vaughn Index Table
+          </button>
+        </div>
+
+        <div class="viewer-controls" id="pdf-toolbar-controls">
+          <span id="ocr-status-badge" class="airgap-pill hidden" title="Local Tesseract OCR extracted the text and coordinates from this scanned document">
+            OCR ACTIVE (Tesseract 5.5)
+          </span>
+          <button id="btn-draw-box-mode" class="btn btn-sm btn-draw-toggle" title="Click and drag on the PDF page to manually redact any area, signature, or missed text">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="18" height="18" rx="2" stroke-dasharray="4 2"/>
+              <line x1="12" y1="8" x2="12" y2="16"/>
+              <line x1="8" y1="12" x2="16" y2="12"/>
+            </svg>
+            <span>Draw Manual Redaction Box: OFF</span>
+          </button>
+
+          <div class="page-nav">
+            <button id="btn-prev-page" class="btn btn-icon" title="Previous Page">&larr;</button>
+            <span id="page-indicator">Page 1 / 1</span>
+            <button id="btn-next-page" class="btn btn-icon" title="Next Page">&rarr;</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Selection Floating Action Bar (appears when user highlights text in Interactive Text View) -->
+      <div id="text-selection-popover" class="selection-popover hidden">
+        <span class="selection-preview" id="selection-preview-text"></span>
+        <select id="popover-entity-select" class="select-control select-sm">
+          <option value="PERSON">Name (PERSON)</option>
+          <option value="PHONE_NUMBER">Phone Number</option>
+          <option value="EMAIL_ADDRESS">Email Address</option>
+          <option value="US_SSN">SSN</option>
+          <option value="STREET_ADDRESS">Address</option>
+          <option value="CUSTOM">Custom</option>
+        </select>
+        <select id="popover-exemption-select" class="select-control select-sm"></select>
+        <button id="btn-popover-redact-all" class="btn btn-primary btn-sm">Redact All Matches</button>
+        <button id="btn-popover-redact-one" class="btn btn-secondary btn-sm">Redact Selection Only</button>
+      </div>
+
+      <!-- Document Stage -->
+      <div class="document-stage" id="document-stage">
+        <!-- Empty / Dropzone State -->
+        <div id="empty-upload-state" class="empty-stage">
+          <div class="dropzone-card" id="dropzone-area">
+            <div class="dropzone-icon">
+              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+                <line x1="12" y1="18" x2="12" y2="12"/>
+                <polyline points="9 15 12 12 15 15"/>
+              </svg>
+            </div>
+            <h2>Upload a Federal FOIA Record, Scanned Document, or Load a Sample Below</h2>
+            <p>Supports <strong>Native &amp; Scanned PDFs (.pdf)</strong>, <strong>Scanned Images (.png, .tiff, .jpg)</strong> via offline <strong>Tesseract OCR</strong>, <strong>Microsoft Word (.docx)</strong>, and <strong>Plain Text (.txt, .csv, .md, .log)</strong>. All processing executes 100% offline on this workstation.</p>
+            <div class="Quick-sample-buttons" id="quick-sample-buttons">
+              <!-- Populated by app.js -->
+            </div>
+          </div>
+        </div>
+
+        <!-- VIEW 1: Visual PDF Page & Bounding Box Canvas -->
+        <div id="view-visual-container" class="stage-view hidden">
+          <div class="canvas-instructions-banner" id="canvas-banner">
+            <span><strong>Interactive Review:</strong> Click any highlighted box to toggle or change its FOIA exemption. Turn on <strong>Draw Manual Redaction Box</strong> above to drag-select any missed area or signature.</span>
+          </div>
+          <div class="pdf-page-scroll">
+            <div class="pdf-canvas-wrapper" id="pdf-canvas-wrapper">
+              <img id="pdf-page-img" alt="Document Page" draggable="false" />
+              <div id="pdf-overlay-layer" class="pdf-overlay-layer"></div>
+              <div id="draw-rubberband" class="draw-rubberband hidden"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- VIEW 2: Interactive Text & Highlight Editor -->
+        <div id="view-text-container" class="stage-view hidden">
+          <div class="canvas-instructions-banner">
+            <span><strong>Interactive Text Review:</strong> Highlight any missed word, name, phone number, or phrase with your cursor to immediately redact it and cite a FOIA exemption. Click any existing highlight to inspect or toggle it.</span>
+          </div>
+          <div class="text-document-sheet">
+            <div id="interactive-text-content" class="interactive-text-content"></div>
+          </div>
+        </div>
+
+        <!-- VIEW 3: Final Sanitized / Burned Output Preview -->
+        <div id="view-burned-container" class="stage-view hidden">
+          <div class="verification-banner" id="verification-banner">
+            <!-- Populated after export/preview -->
+          </div>
+          <div class="burned-preview-grid">
+            <div class="burned-pdf-col">
+              <h3>Sanitized PDF Output (Physical Content-Stream Excision)</h3>
+              <div class="burned-img-wrap">
+                <img id="burned-pdf-img" alt="Sanitized Redacted PDF Page" />
+              </div>
+            </div>
+            <div class="burned-txt-col">
+              <h3>Sanitized Text Stream Verification (Re-Extracted from Output)</h3>
+              <pre id="burned-text-preview" class="burned-text-pre"></pre>
+            </div>
+          </div>
+        </div>
+
+        <!-- VIEW 4: FOIA Vaughn Index Table -->
+        <div id="view-vaughn-container" class="stage-view hidden">
+          <div class="vaughn-header-bar">
+            <div>
+              <h3>Official FOIA Vaughn Index (5 U.S.C. § 552)</h3>
+              <p>Itemized statutory justification log for every active redaction without disclosing underlying PII.</p>
+            </div>
+            <div class="vaughn-download-btns">
+              <button id="btn-download-vaughn-csv" class="btn btn-secondary btn-sm">Download Vaughn CSV</button>
+              <button id="btn-download-vaughn-pdf" class="btn btn-primary btn-sm">Download Vaughn PDF Report</button>
+            </div>
+          </div>
+          <div class="vaughn-table-wrap">
+            <table class="vaughn-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Page</th>
+                  <th>Withheld Category</th>
+                  <th>FOIA Exemption</th>
+                  <th>Statute</th>
+                  <th>Length</th>
+                  <th>Source</th>
+                  <th>Statutory Justification (Vaughn Rationale)</th>
+                </tr>
+              </thead>
+              <tbody id="vaughn-table-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT PANEL: DETECTED REDACTIONS INSPECTOR & EXEMPTION CITATIONS -->
+    <aside class="panel panel-right">
+      <div class="inspector-header">
+        <div class="inspector-title-row">
+          <h2>Redaction Queue &amp; Citations</h2>
+          <span id="active-count-badge" class="count-pill">0 Active</span>
+        </div>
+
+        <!-- Summary KPI Pills -->
+        <div class="kpi-strip" id="kpi-strip">
+          <div class="kpi-box kpi-person">
+            <span class="kpi-num" id="kpi-person-count">0</span>
+            <span class="kpi-lbl">Names</span>
+          </div>
+          <div class="kpi-box kpi-phone">
+            <span class="kpi-num" id="kpi-phone-count">0</span>
+            <span class="kpi-lbl">Phones</span>
+          </div>
+          <div class="kpi-box kpi-email">
+            <span class="kpi-num" id="kpi-email-count">0</span>
+            <span class="kpi-lbl">Emails</span>
+          </div>
+          <div class="kpi-box kpi-other">
+            <span class="kpi-num" id="kpi-other-count">0</span>
+            <span class="kpi-lbl">Other PII</span>
+          </div>
+        </div>
+
+        <!-- Filter & Bulk Exemption Bar -->
+        <div class="filter-bar">
+          <input id="redaction-search-input" type="search" placeholder="Filter by text, name, or exemption..." class="input-sm" />
+          <div class="filter-row">
+            <select id="filter-type-select" class="select-control select-sm">
+              <option value="ALL">All Categories</option>
+              <option value="PERSON">Names (PERSON)</option>
+              <option value="PHONE_NUMBER">Phone Numbers</option>
+              <option value="EMAIL_ADDRESS">Email Addresses</option>
+              <option value="US_SSN">Social Security #</option>
+              <option value="EMPLOYEE_ID">Badge / ID</option>
+              <option value="STREET_ADDRESS">Addresses</option>
+              <option value="CUSTOM">Manual / Custom</option>
+            </select>
+
+            <select id="bulk-exemption-select" class="select-control select-sm" title="Apply FOIA Exemption to all filtered items">
+              <option value="">Bulk Set Exemption...</option>
+            </select>
+          </div>
+
+          <div class="bulk-toggle-row">
+            <button id="btn-enable-all" class="btn btn-xs btn-link">Select All</button>
+            <span>·</span>
+            <button id="btn-disable-all" class="btn btn-xs btn-link">Deselect All</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Scrollable List of Redaction Cards -->
+      <div id="redactions-list-container" class="redactions-list">
+        <div class="empty-list-placeholder">
+          Upload or select a document to inspect detected PII and assign FOIA exemptions.
+        </div>
+      </div>
+
+      <!-- Export & Download Dock -->
+      <div class="export-dock" id="export-dock">
+        <div class="export-options-row">
+          <label class="checkbox-inline">
+            <input type="checkbox" id="chk-stamp-exemption" checked />
+            <span>Stamp FOIA Exemption Code (e.g. <code>(b)(6)</code>) on Redaction Box</span>
+          </label>
+        </div>
+        <div class="download-buttons-grid hidden" id="download-buttons-grid">
+          <a id="dl-primary-btn" class="btn btn-success btn-sm" href="#" download>⬇ Redacted Document</a>
+          <a id="dl-pdf-btn" class="btn btn-primary btn-sm" href="#" download>⬇ Redacted PDF</a>
+          <a id="dl-vaughn-pdf-btn" class="btn btn-secondary btn-sm" href="#" download>⬇ Vaughn Index (PDF)</a>
+          <a id="dl-vaughn-csv-btn" class="btn btn-secondary btn-sm" href="#" download>⬇ Vaughn Index (CSV)</a>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
