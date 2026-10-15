@@ -1,391 +1,498 @@
 /**
- * Federal Offline FOIA Redaction Workbench — Frontend Application Logic
+ * Document Redactor — Interactive Frontend Controller
+ * Aligned with design.md (No emojis, SVG icons only, collapsible overlay left drawer)
  */
 
 const state = {
   meta: null,
   doc: null,
   currentPage: 1,
-  currentView: "visual", // "visual" | "text" | "burned" | "vaughn"
-  drawBoxMode: false,
-  selectedRedactionId: null,
-  detectorConfig: {
-    PERSON: { enabled: true, exemption: "(b)(6)" },
-    PHONE_NUMBER: { enabled: true, exemption: "(b)(6)" },
-    EMAIL_ADDRESS: { enabled: true, exemption: "(b)(6)" },
-    US_SSN: { enabled: true, exemption: "(b)(6)" },
-    EMPLOYEE_ID: { enabled: true, exemption: "(b)(6)" },
-    STREET_ADDRESS: { enabled: true, exemption: "(b)(6)" },
+  activeView: "visual", // "visual" | "text" | "burned" | "vaughn"
+  enabledTypes: new Set(["PERSON", "PHONE_NUMBER", "EMAIL_ADDRESS", "US_SSN", "EMPLOYEE_ID", "STREET_ADDRESS"]),
+  typeDefaultExemptions: {
+    PERSON: "(b)(6)",
+    PHONE_NUMBER: "(b)(6)",
+    EMAIL_ADDRESS: "(b)(6)",
+    US_SSN: "(b)(6)",
+    EMPLOYEE_ID: "(b)(7)(C)",
+    STREET_ADDRESS: "(b)(6)",
+    CUSTOM: "(b)(6)",
   },
-  pendingSelectionText: "",
+  scoreThreshold: 0.45,
+  stripTitles: false,
+  searchFilter: "",
+  typeFilter: "ALL",
+  drawBoxMode: false,
+  isDrawing: false,
+  drawStart: null,
+  resizingBbox: null,
+  selectedTextRange: null,
+  lastExportResult: null,
+  highlightedRedactionId: null,
+  leftDrawerOpen: false,
+};
+
+const TITLE_PREFIX_REGEX = /^(?:(?:Supervisory\s+Special\s+Agent|Special\s+Agent|Senior\s+Analyst|FOIA\s+Officer|Assistant\s+Inspector\s+General|Deputy\s+Director|Branch\s+Chief|Section\s+Chief|General\s+Counsel|Investigator|Inspector|Auditor|Attorney|Counsel|Director|Agent|Officer|Mr\.|Mrs\.|Ms\.|Miss|Dr\.|Prof\.|Hon\.|Rep\.|Sen\.|Dir\.|Gen\.|Lt\.\s*Gen\.|Maj\.\s*Gen\.|Brig\.\s*Gen\.|Col\.|Lt\.\s*Col\.|Maj\.|Capt\.|Lt\.|Sgt\.|Cpl\.|Adm\.|Cmdr\.|SA|SSA|ASAC|SAC)\s+)+/i;
+
+const SVG_ICONS = {
+  lock: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>`,
+  refresh: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>`,
+  scan: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"></path><path d="M17 3h2a2 2 0 0 1 2 2v2"></path><path d="M21 17v2a2 2 0 0 1-2 2h-2"></path><path d="M7 21H5a2 2 0 0 1-2-2v-2"></path><line x1="7" y1="12" x2="17" y2="12"></line></svg>`,
+  draw: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" stroke-dasharray="4 2"></rect><line x1="12" y1="8" x2="12" y2="16"></line><line x1="8" y1="12" x2="16" y2="12"></line></svg>`,
+  download: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>`,
+  close: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`,
+  check: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"></path></svg>`,
 };
 
 document.addEventListener("DOMContentLoaded", async () => {
-  await loadSystemMeta();
+  await loadMeta();
   bindEvents();
 });
 
-async function loadSystemMeta() {
-  try {
-    const res = await fetch("/api/meta");
-    state.meta = await res.json();
+async function loadMeta() {
+  const res = await fetch("/api/meta");
+  const meta = await res.json();
 
-    const engineBadge = document.getElementById("engine-badge");
-    if (engineBadge && state.meta.nlp_engine) {
-      engineBadge.textContent = state.meta.nlp_engine;
+  // Normalize foia_exemptions list into a code-keyed map if returned as an array
+  if (Array.isArray(meta.foia_exemptions)) {
+    const exMap = {};
+    for (const ex of meta.foia_exemptions) {
+      exMap[ex.code] = ex;
     }
-
-    renderDetectorToggles();
-    populateExemptionDropdowns();
-    renderExemptionReferenceCards();
-    populateSampleDocs();
-  } catch (err) {
-    console.error("Failed to load system metadata:", err);
+    meta.foia_exemptions = exMap;
   }
+
+  // Normalize entity_types color property
+  if (meta.entity_types) {
+    for (const info of Object.values(meta.entity_types)) {
+      if (!info.color && info.badge_color) {
+        info.color = info.badge_color;
+      }
+    }
+  }
+
+  state.meta = meta;
+
+  renderDetectorToggles();
+  populateExemptionDropdowns();
+  renderExemptionReferenceCards();
 }
 
 function renderDetectorToggles() {
   const container = document.getElementById("detector-toggles-list");
-  if (!container || !state.meta) return;
   container.innerHTML = "";
 
-  const entityTypes = state.meta.entity_types;
-  const order = ["PERSON", "PHONE_NUMBER", "EMAIL_ADDRESS", "US_SSN", "EMPLOYEE_ID", "STREET_ADDRESS"];
+  const typesOrder = [
+    "PERSON",
+    "PHONE_NUMBER",
+    "EMAIL_ADDRESS",
+    "US_SSN",
+    "EMPLOYEE_ID",
+    "STREET_ADDRESS",
+  ];
 
-  order.forEach((etype) => {
-    const info = entityTypes[etype];
-    if (!info) return;
-    const cfg = state.detectorConfig[etype];
+  for (const typeKey of typesOrder) {
+    const info = state.meta.entity_types[typeKey] || {
+      label: typeKey,
+      color: "#005691",
+      default_exemption: "(b)(6)",
+    };
 
     const row = document.createElement("div");
-    row.className = "detector-row";
-
-    const exOptions = state.meta.foia_exemptions
-      .map(
-        (ex) =>
-          `<option value="${ex.code}" ${cfg.exemption === ex.code ? "selected" : ""}>${ex.code}</option>`
-      )
-      .join("");
-
+    row.className = "detector-item";
     row.innerHTML = `
-      <label class="detector-row-left">
-        <input type="checkbox" data-etype="${etype}" class="detector-chk" ${cfg.enabled ? "checked" : ""} />
-        <span class="detector-dot" style="background:${info.badge_color}"></span>
-        <span>${info.label}</span>
+      <label class="detector-left" style="cursor:pointer;">
+        <input type="checkbox" data-entity-toggle="${typeKey}" ${state.enabledTypes.has(typeKey) ? "checked" : ""} />
+        <span class="cat-dot" style="background:${info.color}"></span>
+        <span class="detector-name">${info.label}</span>
       </label>
-      <select data-etype="${etype}" class="select-control detector-exemption-mini" title="Default FOIA Exemption for ${info.label}">
-        ${exOptions}
-      </select>
+      <span class="detector-exemption-tag" title="Default FOIA Exemption">${info.default_exemption}</span>
     `;
+
+    row.querySelector("input").addEventListener("change", (e) => {
+      if (e.target.checked) {
+        state.enabledTypes.add(typeKey);
+      } else {
+        state.enabledTypes.delete(typeKey);
+      }
+    });
+
     container.appendChild(row);
-  });
-
-  container.querySelectorAll(".detector-chk").forEach((chk) => {
-    chk.addEventListener("change", (e) => {
-      const et = e.target.getAttribute("data-etype");
-      state.detectorConfig[et].enabled = e.target.checked;
-    });
-  });
-
-  container.querySelectorAll(".detector-exemption-mini").forEach((sel) => {
-    sel.addEventListener("change", (e) => {
-      const et = e.target.getAttribute("data-etype");
-      state.detectorConfig[et].exemption = e.target.value;
-    });
-  });
+  }
 }
 
 function populateExemptionDropdowns() {
-  if (!state.meta) return;
   const selects = [
     document.getElementById("manual-exemption-select"),
     document.getElementById("popover-exemption-select"),
-    document.getElementById("bulk-exemption-select"),
   ];
 
-  selects.forEach((sel) => {
-    if (!sel) return;
-    const isBulk = sel.id === "bulk-exemption-select";
-    sel.innerHTML = isBulk ? `<option value="">Bulk Set Exemption...</option>` : "";
-    state.meta.foia_exemptions.forEach((ex) => {
+  const exemptions = state.meta.foia_exemptions;
+  for (const sel of selects) {
+    if (!sel) continue;
+    sel.innerHTML = "";
+    for (const [code, ex] of Object.entries(exemptions)) {
       const opt = document.createElement("option");
-      opt.value = ex.code;
-      opt.textContent = ex.short_label;
+      opt.value = code;
+      opt.textContent = `${code} — ${ex.title.replace(/^Exemption\s+[^\s—]+\s*—\s*/, "")}`;
       sel.appendChild(opt);
-    });
-  });
+    }
+    sel.value = "(b)(6)";
+  }
+
+  const bulkSel = document.getElementById("bulk-exemption-select");
+  if (bulkSel) {
+    bulkSel.innerHTML = `<option value="">Bulk Set Exemption...</option>`;
+    for (const [code, ex] of Object.entries(exemptions)) {
+      const opt = document.createElement("option");
+      opt.value = code;
+      opt.textContent = `Set All Filtered -> ${code}`;
+      bulkSel.appendChild(opt);
+    }
+  }
 }
 
 function renderExemptionReferenceCards() {
   const container = document.getElementById("exemption-reference-cards");
-  if (!container || !state.meta) return;
+  if (!container) return;
   container.innerHTML = "";
-  state.meta.foia_exemptions.slice(0, 6).forEach((ex) => {
-    const div = document.createElement("div");
-    div.className = "exemption-ref-card";
-    div.innerHTML = `
-      <div><strong>${ex.code}</strong> — ${ex.title}</div>
-      <p>${ex.description}</p>
+  for (const [code, ex] of Object.entries(state.meta.foia_exemptions)) {
+    const card = document.createElement("div");
+    card.className = "exemption-ref-card";
+    card.innerHTML = `
+      <div class="exemption-ref-head">
+        <span class="exemption-code-badge">${code}</span>
+        <span class="exemption-statute">${ex.statute}</span>
+      </div>
+      <div class="exemption-ref-desc">${ex.description}</div>
     `;
-    container.appendChild(div);
-  });
-}
-
-function populateSampleDocs() {
-  if (!state.meta) return;
-  const select = document.getElementById("sample-doc-select");
-  const quickContainer = document.getElementById("quick-sample-buttons");
-
-  if (select) {
-    select.innerHTML = `<option value="">Load Sample Federal Record...</option>`;
-    state.meta.sample_documents.forEach((s) => {
-      const opt = document.createElement("option");
-      opt.value = s.filename;
-      opt.textContent = `${s.filename} (${s.size_kb} KB)`;
-      select.appendChild(opt);
-    });
-  }
-
-  if (quickContainer) {
-    quickContainer.innerHTML = "";
-    state.meta.sample_documents.forEach((s) => {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "sample-launch-btn";
-      const badgeType = s.ext.replace(".", "").toUpperCase();
-      btn.innerHTML = `
-        <span>📄 ${s.filename}</span>
-        <span class="badge-tag">${badgeType} · ${s.size_kb} KB</span>
-      `;
-      btn.addEventListener("click", () => loadSampleDocument(s.filename));
-      quickContainer.appendChild(btn);
-    });
+    container.appendChild(card);
   }
 }
 
 function bindEvents() {
-  // File upload input
+  // Collapsible Left Drawer Toggle (Rest of the page remains completely stationary)
+  const drawerBtn = document.getElementById("btn-toggle-left-drawer");
+  const leftDrawer = document.getElementById("left-drawer");
+  if (drawerBtn && leftDrawer) {
+    drawerBtn.addEventListener("click", () => {
+      state.leftDrawerOpen = !state.leftDrawerOpen;
+      leftDrawer.classList.toggle("collapsed", !state.leftDrawerOpen);
+      drawerBtn.setAttribute("aria-expanded", String(state.leftDrawerOpen));
+    });
+  }
+
+  // File Upload Input
   const fileInput = document.getElementById("file-upload-input");
   fileInput.addEventListener("change", async (e) => {
     if (e.target.files && e.target.files[0]) {
       await uploadFile(e.target.files[0]);
-      fileInput.value = "";
+      e.target.value = "";
     }
   });
 
-  // Sample selector
-  const sampleSelect = document.getElementById("sample-doc-select");
-  sampleSelect.addEventListener("change", async (e) => {
-    if (e.target.value) {
-      await loadSampleDocument(e.target.value);
-      sampleSelect.value = "";
-    }
-  });
-
-  // Slider
-  const slider = document.getElementById("confidence-slider");
-  const sliderVal = document.getElementById("confidence-val");
-  slider.addEventListener("input", () => {
-    sliderVal.textContent = Number(slider.value).toFixed(2);
-  });
-
-  // Re-analyze button
-  document.getElementById("btn-reanalyze").addEventListener("click", reanalyzeCurrentDocument);
-
-  // Force OCR button
-  const forceOcrBtn = document.getElementById("btn-force-ocr");
-  if (forceOcrBtn) {
-    forceOcrBtn.addEventListener("click", async () => {
-      if (!state.doc) return;
-      forceOcrBtn.disabled = true;
-      forceOcrBtn.textContent = "⏳ Running Local Tesseract OCR...";
-      try {
-        const res = await fetch(`/api/documents/${state.doc.doc_id}/force-ocr`, { method: "POST" });
-        if (res.ok) {
-          state.doc = await res.json();
-          onDocumentLoaded(state.doc);
-        }
-      } finally {
-        forceOcrBtn.disabled = false;
-        forceOcrBtn.textContent = "🔍 Force Full-Page Tesseract OCR";
+  // Drag & Drop on Empty Stage Dropzone
+  const dropzone = document.getElementById("dropzone-area");
+  if (dropzone) {
+    dropzone.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      dropzone.classList.add("dragover");
+    });
+    dropzone.addEventListener("dragleave", () => dropzone.classList.remove("dragover"));
+    dropzone.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      dropzone.classList.remove("dragover");
+      if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+        await uploadFile(e.dataTransfer.files[0]);
       }
     });
   }
 
-  // Manual text form
-  document.getElementById("manual-text-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    await submitManualTextRedaction();
+  // Confidence Slider
+  const slider = document.getElementById("confidence-slider");
+  const sliderVal = document.getElementById("confidence-val");
+  slider.addEventListener("input", (e) => {
+    state.scoreThreshold = parseFloat(e.target.value);
+    sliderVal.textContent = state.scoreThreshold.toFixed(2);
   });
 
-  // View tabs
+  // Strip Titles Checkbox
+  const stripTitlesChk = document.getElementById("chk-strip-titles");
+  if (stripTitlesChk) {
+    stripTitlesChk.addEventListener("change", async (e) => {
+      state.stripTitles = e.target.checked;
+      if (state.doc) {
+        await reanalyzeCurrentDoc(false);
+      }
+    });
+  }
+
+  // Re-Analyze Button
+  document.getElementById("btn-reanalyze").addEventListener("click", async () => {
+    await reanalyzeCurrentDoc(false);
+  });
+
+  // Force Full-Page OCR Button
+  const forceOcrBtn = document.getElementById("btn-force-ocr");
+  if (forceOcrBtn) {
+    forceOcrBtn.addEventListener("click", async () => {
+      await reanalyzeCurrentDoc(true);
+    });
+  }
+
+  // Manual Text Form
+  document.getElementById("manual-text-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!state.doc) return;
+    const text = document.getElementById("manual-text-input").value.trim();
+    if (!text) return;
+    const entityType = document.getElementById("manual-entity-select").value;
+    const exemption = document.getElementById("manual-exemption-select").value;
+    const comment = document.getElementById("manual-comment-input").value.trim();
+    const allOccurrences = document.getElementById("manual-all-occurrences").checked;
+
+    await addManualTextRedaction({
+      text,
+      entity_type: entityType,
+      exemption_code: exemption,
+      comment,
+      apply_all_occurrences: allOccurrences,
+    });
+
+    document.getElementById("manual-text-input").value = "";
+    document.getElementById("manual-comment-input").value = "";
+  });
+
+  // View Tabs
   document.querySelectorAll(".view-tab").forEach((tab) => {
     tab.addEventListener("click", async () => {
-      const view = tab.getAttribute("data-view");
+      const view = tab.dataset.view;
       await switchView(view);
     });
   });
 
-  // Page navigation
+  // PDF Page Navigation
   document.getElementById("btn-prev-page").addEventListener("click", () => {
-    if (state.doc && state.currentPage > 1) {
+    if (!state.doc) return;
+    if (state.currentPage > 1) {
       state.currentPage--;
-      renderVisualPage();
+      renderVisualPdfPage();
     }
   });
   document.getElementById("btn-next-page").addEventListener("click", () => {
-    if (state.doc && state.currentPage < state.doc.page_count) {
+    if (!state.doc) return;
+    if (state.currentPage < state.doc.page_count) {
       state.currentPage++;
-      renderVisualPage();
+      renderVisualPdfPage();
     }
   });
 
-  // Draw Box toggle
+  // Draw Box Mode Toggle
   const drawBtn = document.getElementById("btn-draw-box-mode");
   drawBtn.addEventListener("click", () => {
     state.drawBoxMode = !state.drawBoxMode;
     drawBtn.classList.toggle("active", state.drawBoxMode);
-    drawBtn.querySelector("span").textContent = `Draw Manual Redaction Box: ${
-      state.drawBoxMode ? "ON (Drag on Page)" : "OFF"
-    }`;
+    drawBtn.innerHTML = `${SVG_ICONS.draw} <span>Draw Redaction Box: ${state.drawBoxMode ? "ON" : "OFF"}</span>`;
     const wrapper = document.getElementById("pdf-canvas-wrapper");
-    if (wrapper) {
-      wrapper.classList.toggle("crosshair-mode", state.drawBoxMode);
-    }
+    wrapper.classList.toggle("crosshair-mode", state.drawBoxMode);
   });
 
-  // PDF Canvas Rubberband Drawing
+  // Rubber-band Box Drawing on PDF Page
   setupPdfBoxDrawing();
 
-  // Interactive Text Selection Popover
-  setupTextSelectionPopover();
+  // Text Selection in Interactive Text View
+  setupTextSelectionRedaction();
 
-  // Right panel search & filter
-  document.getElementById("redaction-search-input").addEventListener("input", renderRedactionsList);
-  document.getElementById("filter-type-select").addEventListener("change", renderRedactionsList);
-
-  // Bulk Exemption
-  const bulkExSelect = document.getElementById("bulk-exemption-select");
-  bulkExSelect.addEventListener("change", async () => {
-    if (!bulkExSelect.value || !state.doc) return;
-    const typeFilter = document.getElementById("filter-type-select").value;
-    await bulkUpdateRedactions({
-      entity_type_filter: typeFilter === "ALL" ? null : typeFilter,
-      exemption_code: bulkExSelect.value,
-    });
-    bulkExSelect.value = "";
+  // Right Panel Filters & Bulk Controls
+  document.getElementById("redaction-search-input").addEventListener("input", (e) => {
+    state.searchFilter = e.target.value.toLowerCase();
+    renderRedactionsQueue();
   });
 
-  // Select All / Deselect All
+  document.getElementById("filter-type-select").addEventListener("change", (e) => {
+    state.typeFilter = e.target.value;
+    renderRedactionsQueue();
+  });
+
+  document.getElementById("bulk-exemption-select").addEventListener("change", async (e) => {
+    const code = e.target.value;
+    if (!code || !state.doc) return;
+    const filtered = getFilteredRedactions();
+    for (const r of filtered) {
+      r.exemption_code = code;
+    }
+    e.target.value = "";
+    await syncRedactionsToServer();
+  });
+
   document.getElementById("btn-enable-all").addEventListener("click", async () => {
-    const typeFilter = document.getElementById("filter-type-select").value;
-    await bulkUpdateRedactions({
-      entity_type_filter: typeFilter === "ALL" ? null : typeFilter,
-      enabled: true,
-    });
+    if (!state.doc) return;
+    for (const r of getFilteredRedactions()) {
+      r.enabled = true;
+    }
+    await syncRedactionsToServer();
   });
 
   document.getElementById("btn-disable-all").addEventListener("click", async () => {
-    const typeFilter = document.getElementById("filter-type-select").value;
-    await bulkUpdateRedactions({
-      entity_type_filter: typeFilter === "ALL" ? null : typeFilter,
-      enabled: false,
-    });
+    if (!state.doc) return;
+    for (const r of getFilteredRedactions()) {
+      r.enabled = false;
+    }
+    await syncRedactionsToServer();
   });
 
-  // Finalize & Export button
+  // Finalize & Burn Redactions Button
   document.getElementById("btn-finalize-export").addEventListener("click", async () => {
     await executeBurnAndExport();
   });
 
-  // Vaughn download buttons
-  document.getElementById("btn-download-vaughn-csv").addEventListener("click", () => {
-    if (state.doc) window.location.href = `/api/documents/${state.doc.doc_id}/download/vaughn_csv`;
+  // Vaughn Index Download Buttons
+  document.getElementById("btn-download-vaughn-csv").addEventListener("click", async () => {
+    if (!state.lastExportResult) await executeBurnAndExport(false);
+    if (state.lastExportResult) window.open(state.lastExportResult.downloads.vaughn_csv, "_blank");
   });
-  document.getElementById("btn-download-vaughn-pdf").addEventListener("click", () => {
-    if (state.doc) window.location.href = `/api/documents/${state.doc.doc_id}/download/vaughn_pdf`;
+  document.getElementById("btn-download-vaughn-pdf").addEventListener("click", async () => {
+    if (!state.lastExportResult) await executeBurnAndExport(false);
+    if (state.lastExportResult) window.open(state.lastExportResult.downloads.vaughn_pdf, "_blank");
   });
 }
 
 async function uploadFile(file) {
-  const formData = new FormData();
-  formData.append("file", file);
-  const res = await fetch("/api/documents/upload", {
-    method: "POST",
-    body: formData,
-  });
-  if (!res.ok) {
-    const err = await res.json();
-    alert(`Upload error: ${err.detail || res.statusText}`);
-    return;
+  setLoadingState(true, `Analyzing ${file.name}...`);
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch("/api/documents/upload", {
+      method: "POST",
+      body: fd,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert(`Error uploading file: ${err.detail || res.statusText}`);
+      return;
+    }
+    const doc = await res.json();
+    onDocumentLoaded(doc);
+  } finally {
+    setLoadingState(false);
   }
-  const docData = await res.json();
-  onDocumentLoaded(docData);
 }
 
-async function loadSampleDocument(filename) {
-  const res = await fetch(`/api/documents/load-sample/${encodeURIComponent(filename)}`, {
-    method: "POST",
-  });
-  if (!res.ok) {
-    alert("Failed to load sample document.");
-    return;
-  }
-  const docData = await res.json();
-  onDocumentLoaded(docData);
-}
-
-function onDocumentLoaded(docData) {
-  state.doc = docData;
+function onDocumentLoaded(doc) {
+  if (!doc || !doc.doc_id) return;
+  state.doc = doc;
   state.currentPage = 1;
-  state.selectedRedactionId = null;
+  state.lastExportResult = null;
 
   document.getElementById("empty-upload-state").classList.add("hidden");
   document.getElementById("btn-reanalyze").disabled = false;
-  document.getElementById("btn-add-manual-text").disabled = false;
-  document.getElementById("btn-finalize-export").disabled = false;
-
   const forceOcrBtn = document.getElementById("btn-force-ocr");
   if (forceOcrBtn) {
-    forceOcrBtn.disabled = docData.file_type !== "pdf";
+    forceOcrBtn.disabled = !(doc.ext === ".pdf" || doc.is_image_doc);
+  }
+  document.getElementById("btn-add-manual-text").disabled = false;
+  document.getElementById("btn-finalize-export").disabled = false;
+  document.getElementById("download-buttons-grid").classList.add("hidden");
+
+  // Update active document pill in header
+  const docPill = document.getElementById("active-doc-pill");
+  if (docPill) {
+    docPill.textContent = doc.filename;
+    docPill.classList.remove("hidden");
   }
 
+  // Show OCR status badge if document was processed with pure-pip RapidOCR
   const ocrBadge = document.getElementById("ocr-status-badge");
   if (ocrBadge) {
-    if (docData.is_scanned_document) {
+    if (doc.ocr_applied) {
       ocrBadge.classList.remove("hidden");
-      ocrBadge.textContent = `OCR ACTIVE · ${docData.ocr_pages_count || 1} Scanned Page(s)`;
+      ocrBadge.textContent = doc.is_image_doc
+        ? `OCR Active (${(doc.ext || "").replace(".", "").toUpperCase()} Scan)`
+        : `OCR Active (${(doc.ocr_pages || []).length || doc.ocr_pages_count || 1} pg)`;
     } else {
       ocrBadge.classList.add("hidden");
     }
   }
 
-  // Automatically pick best initial view: "visual" for PDF, "text" for DOCX/TXT
-  if (docData.file_type === "pdf") {
-    switchView("visual");
-  } else {
-    switchView("text");
-  }
-
-  refreshAllPanels();
+  switchView(state.activeView === "burned" ? "visual" : state.activeView);
+  renderAllPanels();
 }
 
-function refreshAllPanels() {
-  if (!state.doc) return;
-  updateKpiCounters();
-  renderRedactionsList();
-  renderInteractiveTextView();
-  if (state.doc.file_type === "pdf") {
-    renderVisualPage();
+async function reanalyzeCurrentDoc(forceOcr = false) {
+  if (!state.doc || !state.doc.doc_id) return;
+  setLoadingState(true, forceOcr ? "Running Pure-Pip RapidOCR & PII Detection..." : "Re-running PII detection...");
+  try {
+    const res = await fetch(`/api/documents/${state.doc.doc_id}/reanalyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled_types: Array.from(state.enabledTypes),
+        score_threshold: state.scoreThreshold,
+        type_exemptions: state.typeDefaultExemptions,
+        force_ocr: forceOcr,
+        strip_titles: state.stripTitles,
+      }),
+    });
+    if (!res.ok) return;
+    const doc = await res.json();
+    onDocumentLoaded(doc);
+  } finally {
+    setLoadingState(false);
+  }
+}
+
+async function addManualTextRedaction(payload) {
+  if (!state.doc || !state.doc.doc_id) return;
+  const res = await fetch(`/api/documents/${state.doc.doc_id}/redactions/manual-text`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) return;
+  const doc = await res.json();
+  if (doc && doc.doc_id) {
+    state.doc = doc;
+    state.lastExportResult = null;
+    renderAllPanels();
+  }
+}
+
+async function syncRedactionsToServer() {
+  if (!state.doc || !state.doc.doc_id) return;
+  const res = await fetch(`/api/documents/${state.doc.doc_id}/redactions`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ redactions: state.doc.redactions }),
+  });
+  if (!res.ok) return;
+  const doc = await res.json();
+  if (doc && doc.doc_id) {
+    state.doc = doc;
+    state.lastExportResult = null;
+    renderAllPanels();
+  }
+}
+
+async function patchSingleRedaction(redactionId, patchPayload) {
+  if (!state.doc || !state.doc.doc_id) return;
+  const res = await fetch(`/api/documents/${state.doc.doc_id}/redactions/${redactionId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patchPayload),
+  });
+  if (!res.ok) return;
+  const doc = await res.json();
+  if (doc && doc.doc_id) {
+    state.doc = doc;
+    state.lastExportResult = null;
+    renderAllPanels();
   }
 }
 
 async function switchView(viewName) {
-  if (!state.doc) return;
-  state.currentView = viewName;
-
+  state.activeView = viewName;
   document.querySelectorAll(".view-tab").forEach((t) => {
-    t.classList.toggle("active", t.getAttribute("data-view") === viewName);
+    t.classList.toggle("active", t.dataset.view === viewName);
   });
 
   const views = {
@@ -394,180 +501,282 @@ async function switchView(viewName) {
     burned: document.getElementById("view-burned-container"),
     vaughn: document.getElementById("view-vaughn-container"),
   };
+
   Object.values(views).forEach((el) => el.classList.add("hidden"));
+  if (!state.doc) {
+    document.getElementById("empty-upload-state").classList.remove("hidden");
+    return;
+  }
 
   const pdfControls = document.getElementById("pdf-toolbar-controls");
-  pdfControls.style.visibility =
-    viewName === "visual" && state.doc.file_type === "pdf" ? "visible" : "hidden";
+  if (pdfControls) {
+    pdfControls.classList.toggle("hidden", !(viewName === "visual" && state.doc));
+  }
 
   if (viewName === "visual") {
-    if (state.doc.file_type !== "pdf") {
-      // For DOCX/TXT, generate burned PDF preview or switch to interactive text
-      views.text.classList.remove("hidden");
-      document.getElementById("tab-interactive-text").classList.add("active");
-      document.getElementById("tab-visual-pdf").classList.remove("active");
-      renderInteractiveTextView();
-      return;
-    }
     views.visual.classList.remove("hidden");
-    renderVisualPage();
+    renderVisualPdfPage();
   } else if (viewName === "text") {
     views.text.classList.remove("hidden");
     renderInteractiveTextView();
   } else if (viewName === "burned") {
     views.burned.classList.remove("hidden");
-    await executeBurnAndExport(false);
+    if (!state.lastExportResult) {
+      await executeBurnAndExport(false);
+    } else {
+      renderBurnedPreview();
+    }
   } else if (viewName === "vaughn") {
     views.vaughn.classList.remove("hidden");
-    await executeBurnAndExport(false);
+    renderVaughnIndexTable();
   }
 }
 
-function updateKpiCounters() {
-  if (!state.doc) return;
-  const active = state.doc.redactions.filter((r) => r.enabled);
-  document.getElementById("active-count-badge").textContent = `${active.length} Active`;
+function renderAllPanels() {
+  if (!state.doc || !state.doc.redactions) return;
+  updateKpiStrip();
+  renderRedactionsQueue();
 
-  let person = 0,
-    phone = 0,
-    email = 0,
-    other = 0;
-  active.forEach((r) => {
-    if (r.entity_type === "PERSON") person++;
-    else if (r.entity_type === "PHONE_NUMBER") phone++;
-    else if (r.entity_type === "EMAIL_ADDRESS") email++;
-    else other++;
-  });
-
-  document.getElementById("kpi-person-count").textContent = person;
-  document.getElementById("kpi-phone-count").textContent = phone;
-  document.getElementById("kpi-email-count").textContent = email;
-  document.getElementById("kpi-other-count").textContent = other;
+  if (state.activeView === "visual") {
+    renderVisualPdfPage();
+  } else if (state.activeView === "text") {
+    renderInteractiveTextView();
+  } else if (state.activeView === "vaughn") {
+    renderVaughnIndexTable();
+  }
 }
 
-function renderVisualPage() {
-  if (!state.doc || state.doc.file_type !== "pdf") return;
-  const pageInd = document.getElementById("page-indicator");
-  pageInd.textContent = `Page ${state.currentPage} / ${state.doc.page_count}`;
+function updateKpiStrip() {
+  const active = (state.doc.redactions || []).filter((r) => r.enabled);
+  document.getElementById("active-count-badge").textContent = `${active.length} Active`;
+
+  const counts = { PERSON: 0, PHONE_NUMBER: 0, EMAIL_ADDRESS: 0, OTHER: 0 };
+  for (const r of active) {
+    if (r.entity_type === "PERSON") counts.PERSON++;
+    else if (r.entity_type === "PHONE_NUMBER") counts.PHONE_NUMBER++;
+    else if (r.entity_type === "EMAIL_ADDRESS") counts.EMAIL_ADDRESS++;
+    else counts.OTHER++;
+  }
+
+  document.getElementById("kpi-person-count").textContent = counts.PERSON;
+  document.getElementById("kpi-phone-count").textContent = counts.PHONE_NUMBER;
+  document.getElementById("kpi-email-count").textContent = counts.EMAIL_ADDRESS;
+  document.getElementById("kpi-other-count").textContent = counts.OTHER;
+}
+
+// ==================== VISUAL PDF PAGE & BOUNDING BOX OVERLAYS ====================
+
+function renderVisualPdfPage() {
+  if (!state.doc || !state.doc.doc_id) return;
+  const pageNum = state.currentPage;
+  document.getElementById("page-indicator").textContent = `Page ${pageNum} / ${state.doc.page_count}`;
 
   const img = document.getElementById("pdf-page-img");
   const overlay = document.getElementById("pdf-overlay-layer");
   overlay.innerHTML = "";
 
+  const targetSrc = `/api/documents/${state.doc.doc_id}/page/${pageNum}/image?t=${(state.doc.redactions || []).length}`;
   img.onload = () => {
-    renderPdfBoundingBoxes();
+    drawPageBoundingBoxes(pageNum);
   };
-  img.src = `/api/documents/${state.doc.doc_id}/page/${state.currentPage}/image?dpi=150&t=${Date.now()}`;
+  img.src = targetSrc;
 }
 
-function renderPdfBoundingBoxes() {
+function drawPageBoundingBoxes(pageNum) {
   const overlay = document.getElementById("pdf-overlay-layer");
-  if (!overlay || !state.doc) return;
   overlay.innerHTML = "";
 
-  const entityMeta = state.meta ? state.meta.entity_types : {};
-  const pageRedactions = state.doc.redactions.filter(
-    (r) => (r.page_number || 1) === state.currentPage
-  );
+  const pagesList = state.doc.pages_meta || state.doc.pages || [];
+  const pageMeta = pagesList.find((p) => (p.page || p.page_number) === pageNum);
+  if (!pageMeta) return;
 
-  pageRedactions.forEach((r) => {
-    const bboxes = r.bboxes || [];
-    const meta = entityMeta[r.entity_type] || {
-      border_color: "#2563eb",
-      bg_color: "rgba(37, 99, 235, 0.25)",
-    };
+  const pageW = pageMeta.width || 612;
+  const pageH = pageMeta.height || 792;
 
-    bboxes.forEach((b) => {
+  for (const r of state.doc.redactions || []) {
+    const rawRects = r.rects || r.bboxes || [];
+    const pageRects = rawRects.filter((rc) => (rc.page || rc.page_number) === pageNum);
+    const typeInfo = state.meta.entity_types[r.entity_type] || { color: "#005691" };
+
+    pageRects.forEach((rc, rectIdx) => {
       const box = document.createElement("div");
-      box.className = `pdf-bbox ${r.enabled ? "" : "disabled"} ${
-        state.selectedRedactionId === r.id ? "selected" : ""
+      box.className = `bbox-overlay ${r.enabled ? "" : "disabled-redaction"} ${
+        state.highlightedRedactionId === r.id ? "highlighted" : ""
       }`;
-      box.style.left = `${(b.norm_x * 100).toFixed(3)}%`;
-      box.style.top = `${(b.norm_y * 100).toFixed(3)}%`;
-      box.style.width = `${Math.max(b.norm_w * 100, 1.2).toFixed(3)}%`;
-      box.style.height = `${Math.max(b.norm_h * 100, 1.4).toFixed(3)}%`;
-      box.style.borderColor = meta.border_color;
-      if (r.enabled && state.selectedRedactionId !== r.id) {
-        box.style.backgroundColor = meta.bg_color;
-      }
-      box.title = `${r.entity_label}: "${r.text}" | Exemption: ${r.exemption_code} (Click to inspect/toggle)`;
+      box.dataset.redactionId = r.id;
+
+      const leftPct = (rc.x0 / pageW) * 100;
+      const topPct = (rc.y0 / pageH) * 100;
+      const widthPct = ((rc.x1 - rc.x0) / pageW) * 100;
+      const heightPct = ((rc.y1 - rc.y0) / pageH) * 100;
+
+      box.style.left = `${leftPct}%`;
+      box.style.top = `${topPct}%`;
+      box.style.width = `${widthPct}%`;
+      box.style.height = `${heightPct}%`;
+      box.style.borderColor = typeInfo.color;
+      box.style.backgroundColor = hexToRgba(typeInfo.color, 0.24);
+
+      box.title = `${r.entity_type}: "${r.text}" | FOIA ${r.exemption_code} (Click to toggle, or drag side handles to adjust width)`;
 
       const tag = document.createElement("span");
-      tag.className = "pdf-bbox-tag";
+      tag.className = "bbox-tag";
       tag.textContent = r.exemption_code;
       box.appendChild(tag);
 
-      box.addEventListener("click", (e) => {
+      // Left & Right Horizontal Resize Handles for adjusting redaction length visually
+      const handleLeft = document.createElement("div");
+      handleLeft.className = "bbox-handle bbox-handle-left";
+      handleLeft.title = "Drag to adjust start of redaction box";
+
+      const handleRight = document.createElement("div");
+      handleRight.className = "bbox-handle bbox-handle-right";
+      handleRight.title = "Drag to adjust end of redaction box";
+
+      handleLeft.addEventListener("mousedown", (e) => {
         e.stopPropagation();
-        state.selectedRedactionId = r.id;
-        renderPdfBoundingBoxes();
-        renderRedactionsList();
-        scrollToRedactionCard(r.id);
+        e.preventDefault();
+        startBboxHorizontalResize(e, r, rectIdx, "left", pageW, pageH);
+      });
+
+      handleRight.addEventListener("mousedown", (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        startBboxHorizontalResize(e, r, rectIdx, "right", pageW, pageH);
+      });
+
+      box.appendChild(handleLeft);
+      box.appendChild(handleRight);
+
+      box.addEventListener("click", async (e) => {
+        if (state.drawBoxMode || state.resizingBbox) return;
+        e.stopPropagation();
+        r.enabled = !r.enabled;
+        await syncRedactionsToServer();
+      });
+
+      box.addEventListener("mouseenter", () => {
+        highlightCardInQueue(r.id, true);
+      });
+      box.addEventListener("mouseleave", () => {
+        highlightCardInQueue(r.id, false);
       });
 
       overlay.appendChild(box);
     });
-  });
+  }
+}
+
+function startBboxHorizontalResize(startEvent, redactionItem, rectIdx, side, pageW, pageH) {
+  const wrapper = document.getElementById("pdf-canvas-wrapper");
+  const wrapperRect = wrapper.getBoundingClientRect();
+  const targetBbox = (redactionItem.bboxes || redactionItem.rects || [])[rectIdx];
+  if (!targetBbox) return;
+
+  state.resizingBbox = {
+    redactionItem,
+    targetBbox,
+    side,
+    pageW,
+    pageH,
+    wrapperRect,
+  };
+
+  const onMouseMove = (moveEvent) => {
+    if (!state.resizingBbox) return;
+    const relX = Math.max(0, Math.min(wrapperRect.width, moveEvent.clientX - wrapperRect.left));
+    const pdfX = (relX / wrapperRect.width) * pageW;
+
+    if (side === "left") {
+      targetBbox.x0 = Math.min(pdfX, targetBbox.x1 - 6);
+    } else {
+      targetBbox.x1 = Math.max(pdfX, targetBbox.x0 + 6);
+    }
+    targetBbox.norm_x = targetBbox.x0 / pageW;
+    targetBbox.norm_w = (targetBbox.x1 - targetBbox.x0) / pageW;
+
+    drawPageBoundingBoxes(state.currentPage);
+  };
+
+  const onMouseUp = async () => {
+    window.removeEventListener("mousemove", onMouseMove);
+    window.removeEventListener("mouseup", onMouseUp);
+    if (!state.resizingBbox) return;
+    state.resizingBbox = null;
+
+    await patchSingleRedaction(redactionItem.id, {
+      bboxes: redactionItem.bboxes || redactionItem.rects,
+    });
+  };
+
+  window.addEventListener("mousemove", onMouseMove);
+  window.addEventListener("mouseup", onMouseUp);
 }
 
 function setupPdfBoxDrawing() {
   const wrapper = document.getElementById("pdf-canvas-wrapper");
   const rubberband = document.getElementById("draw-rubberband");
-  let isDrawing = false;
-  let startX = 0;
-  let startY = 0;
 
   wrapper.addEventListener("mousedown", (e) => {
-    if (!state.drawBoxMode || !state.doc || state.doc.file_type !== "pdf") return;
+    if (!state.drawBoxMode || !state.doc) return;
+    e.preventDefault();
     const rect = wrapper.getBoundingClientRect();
-    isDrawing = true;
-    startX = e.clientX - rect.left;
-    startY = e.clientY - rect.top;
-
-    rubberband.style.left = `${startX}px`;
-    rubberband.style.top = `${startY}px`;
+    state.isDrawing = true;
+    state.drawStart = {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top,
+    };
+    rubberband.style.left = `${state.drawStart.x}px`;
+    rubberband.style.top = `${state.drawStart.y}px`;
     rubberband.style.width = `0px`;
     rubberband.style.height = `0px`;
     rubberband.classList.remove("hidden");
   });
 
   window.addEventListener("mousemove", (e) => {
-    if (!isDrawing) return;
+    if (!state.isDrawing || !state.drawStart) return;
     const rect = wrapper.getBoundingClientRect();
-    const curX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
-    const curY = Math.max(0, Math.min(e.clientY - rect.top, rect.height));
+    const curX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+    const curY = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
 
-    const left = Math.min(startX, curX);
-    const top = Math.min(startY, curY);
-    const width = Math.abs(curX - startX);
-    const height = Math.abs(curY - startY);
+    const x0 = Math.min(state.drawStart.x, curX);
+    const y0 = Math.min(state.drawStart.y, curY);
+    const w = Math.abs(curX - state.drawStart.x);
+    const h = Math.abs(curY - state.drawStart.y);
 
-    rubberband.style.left = `${left}px`;
-    rubberband.style.top = `${top}px`;
-    rubberband.style.width = `${width}px`;
-    rubberband.style.height = `${height}px`;
+    rubberband.style.left = `${x0}px`;
+    rubberband.style.top = `${y0}px`;
+    rubberband.style.width = `${w}px`;
+    rubberband.style.height = `${h}px`;
   });
 
   window.addEventListener("mouseup", async (e) => {
-    if (!isDrawing) return;
-    isDrawing = false;
+    if (!state.isDrawing || !state.drawStart) return;
+    state.isDrawing = false;
     rubberband.classList.add("hidden");
 
     const rect = wrapper.getBoundingClientRect();
-    const curX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
-    const curY = Math.max(0, Math.min(e.clientY - rect.top, rect.height));
+    const curX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+    const curY = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
 
-    const left = Math.min(startX, curX);
-    const top = Math.min(startY, curY);
-    const width = Math.abs(curX - startX);
-    const height = Math.abs(curY - startY);
+    const pxX0 = Math.min(state.drawStart.x, curX);
+    const pxY0 = Math.min(state.drawStart.y, curY);
+    const pxX1 = Math.max(state.drawStart.x, curX);
+    const pxY1 = Math.max(state.drawStart.y, curY);
 
-    if (width < 8 || height < 6) return;
+    if (pxX1 - pxX0 < 8 || pxY1 - pxY0 < 6) return;
 
-    const norm_x = left / rect.width;
-    const norm_y = top / rect.height;
-    const norm_w = width / rect.width;
-    const norm_h = height / rect.height;
+    const pagesList = state.doc.pages_meta || state.doc.pages || [];
+    const pageMeta = pagesList.find((p) => (p.page || p.page_number) === state.currentPage);
+    if (!pageMeta) return;
+
+    const scaleX = pageMeta.width / rect.width;
+    const scaleY = pageMeta.height / rect.height;
+
+    const pdfX0 = pxX0 * scaleX;
+    const pdfY0 = pxY0 * scaleY;
+    const pdfX1 = pxX1 * scaleX;
+    const pdfY1 = pxY1 * scaleY;
 
     const entityType = document.getElementById("manual-entity-select").value || "CUSTOM";
     const exemptionCode = document.getElementById("manual-exemption-select").value || "(b)(6)";
@@ -577,52 +786,56 @@ function setupPdfBoxDrawing() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         page_number: state.currentPage,
-        norm_x,
-        norm_y,
-        norm_w,
-        norm_h,
+        x0: pdfX0,
+        y0: pdfY0,
+        x1: pdfX1,
+        y1: pdfY1,
         entity_type: entityType,
         exemption_code: exemptionCode,
-        comment: "Manual region redaction drawn on PDF page",
+        label: "[Area Redaction]",
+        comment: "Manual bounding box area redaction",
       }),
     });
 
     if (res.ok) {
-      state.doc = await res.json();
-      refreshAllPanels();
+      const updated = await res.json();
+      if (updated && updated.doc_id) {
+        state.doc = updated;
+        state.lastExportResult = null;
+        renderAllPanels();
+      }
     }
   });
 }
 
-function renderInteractiveTextView() {
-  const container = document.getElementById("interactive-text-content");
-  if (!container || !state.doc) return;
+// ==================== INTERACTIVE TEXT VIEW & HIGHLIGHTING ====================
 
+function renderInteractiveTextView() {
+  if (!state.doc) return;
+  const container = document.getElementById("interactive-text-content");
   const fullText = state.doc.full_text || "";
-  const spanRedactions = state.doc.redactions
-    .filter((r) => r.start !== null && r.end !== null && r.end > r.start)
+
+  const charSpans = (state.doc.redactions || [])
+    .filter((r) => typeof r.start === "number" && typeof r.end === "number" && r.end > r.start)
+    .slice()
     .sort((a, b) => a.start - b.start);
 
-  // Build non-overlapping display segments
   let html = "";
   let cursor = 0;
 
-  spanRedactions.forEach((r) => {
-    if (r.start < cursor) return; // skip overlapping display span
+  for (const r of charSpans) {
+    if (r.start < cursor) continue;
     if (r.start > cursor) {
       html += escapeHtml(fullText.slice(cursor, r.start));
     }
-    const snippet = escapeHtml(fullText.slice(r.start, r.end));
-    const disabledCls = r.enabled ? "" : "disabled";
-    html += `<span class="inline-redaction-mark type-${r.entity_type} ${disabledCls}" data-rid="${
-      r.id
-    }" title="${escapeHtml(r.entity_label)} | Exemption ${escapeHtml(
+
+    const segment = escapeHtml(fullText.slice(r.start, r.end));
+    const cls = `redaction-mark mark-${r.entity_type} ${r.enabled ? "" : "disabled"}`;
+    html += `<span class="${cls}" data-redaction-id="${r.id}" title="${r.entity_type} | Click to toggle redaction">${segment}<span class="redaction-mark-exemption">${escapeHtml(
       r.exemption_code
-    )} (Click to toggle)">${snippet}<sup class="inline-exemption-sup">${escapeHtml(
-      r.exemption_code
-    )}</sup></span>`;
+    )}</span></span>`;
     cursor = r.end;
-  });
+  }
 
   if (cursor < fullText.length) {
     html += escapeHtml(fullText.slice(cursor));
@@ -630,29 +843,30 @@ function renderInteractiveTextView() {
 
   container.innerHTML = html;
 
-  container.querySelectorAll(".inline-redaction-mark").forEach((el) => {
-    el.addEventListener("click", async (e) => {
+  container.querySelectorAll(".redaction-mark").forEach((markEl) => {
+    markEl.addEventListener("click", async (e) => {
       e.stopPropagation();
-      const rid = el.getAttribute("data-rid");
-      const item = state.doc.redactions.find((x) => x.id === rid);
-      if (item) {
-        await updateSingleRedaction(rid, { enabled: !item.enabled });
+      const id = markEl.dataset.redactionId;
+      const target = state.doc.redactions.find((r) => r.id === id);
+      if (target) {
+        target.enabled = !target.enabled;
+        await syncRedactionsToServer();
       }
     });
   });
 }
 
-function setupTextSelectionPopover() {
-  const textSheet = document.getElementById("interactive-text-content");
+function setupTextSelectionRedaction() {
+  const textContainer = document.getElementById("view-text-container");
   const popover = document.getElementById("text-selection-popover");
   const previewSpan = document.getElementById("selection-preview-text");
 
-  textSheet.addEventListener("mouseup", () => {
+  textContainer.addEventListener("mouseup", () => {
     const sel = window.getSelection();
-    const selectedText = sel ? sel.toString().trim() : "";
-    if (selectedText && selectedText.length >= 2 && selectedText.length <= 160) {
-      state.pendingSelectionText = selectedText;
-      previewSpan.textContent = `"${selectedText}"`;
+    const selectedStr = sel ? sel.toString().trim() : "";
+    if (selectedStr && selectedStr.length >= 2) {
+      state.selectedTextRange = selectedStr;
+      previewSpan.textContent = `"${selectedStr}"`;
       popover.classList.remove("hidden");
     } else {
       popover.classList.add("hidden");
@@ -660,297 +874,365 @@ function setupTextSelectionPopover() {
   });
 
   document.getElementById("btn-popover-redact-all").addEventListener("click", async () => {
-    if (!state.pendingSelectionText || !state.doc) return;
-    await addManualTextRedactionRequest({
-      text: state.pendingSelectionText,
-      entity_type: document.getElementById("popover-entity-select").value,
-      exemption_code: document.getElementById("popover-exemption-select").value,
-      apply_all_occurrences: true,
-    });
+    if (!state.selectedTextRange) return;
+    const entityType = document.getElementById("popover-entity-select").value;
+    const exemption = document.getElementById("popover-exemption-select").value;
     popover.classList.add("hidden");
     window.getSelection().removeAllRanges();
+    await addManualTextRedaction({
+      text: state.selectedTextRange,
+      entity_type: entityType,
+      exemption_code: exemption,
+      comment: "Added via interactive text selection",
+      apply_all_occurrences: true,
+    });
   });
 
   document.getElementById("btn-popover-redact-one").addEventListener("click", async () => {
-    if (!state.pendingSelectionText || !state.doc) return;
-    await addManualTextRedactionRequest({
-      text: state.pendingSelectionText,
-      entity_type: document.getElementById("popover-entity-select").value,
-      exemption_code: document.getElementById("popover-exemption-select").value,
-      apply_all_occurrences: false,
-    });
+    if (!state.selectedTextRange) return;
+    const entityType = document.getElementById("popover-entity-select").value;
+    const exemption = document.getElementById("popover-exemption-select").value;
     popover.classList.add("hidden");
     window.getSelection().removeAllRanges();
+    await addManualTextRedaction({
+      text: state.selectedTextRange,
+      entity_type: entityType,
+      exemption_code: exemption,
+      comment: "Added via single text selection",
+      apply_all_occurrences: false,
+    });
   });
 }
 
-function renderRedactionsList() {
-  const container = document.getElementById("redactions-list-container");
-  if (!container || !state.doc) return;
+// ==================== RIGHT PANEL: REDACTION QUEUE (WITH SPAN TRIMMING & EDITING) ====================
 
-  const query = (document.getElementById("redaction-search-input").value || "").toLowerCase().trim();
-  const typeFilter = document.getElementById("filter-type-select").value;
-  const entityMeta = state.meta ? state.meta.entity_types : {};
-
-  const filtered = state.doc.redactions.filter((r) => {
-    if (typeFilter !== "ALL" && r.entity_type !== typeFilter) return false;
-    if (query) {
-      const hay = `${r.text} ${r.entity_label} ${r.exemption_code} ${r.comment || ""}`.toLowerCase();
-      if (!hay.includes(query)) return false;
+function getFilteredRedactions() {
+  if (!state.doc || !state.doc.redactions) return [];
+  return state.doc.redactions.filter((r) => {
+    if (state.typeFilter !== "ALL" && r.entity_type !== state.typeFilter) {
+      return false;
+    }
+    if (state.searchFilter) {
+      const hay = `${r.text} ${r.entity_type} ${r.exemption_code} ${r.comment || ""}`.toLowerCase();
+      if (!hay.includes(state.searchFilter)) return false;
     }
     return true;
   });
+}
 
-  if (filtered.length === 0) {
-    container.innerHTML = `<div class="empty-list-placeholder">No matching redaction items found.</div>`;
+function renderRedactionsQueue() {
+  const container = document.getElementById("redactions-list-container");
+  if (!state.doc) return;
+
+  const list = getFilteredRedactions();
+  container.innerHTML = "";
+
+  if (list.length === 0) {
+    container.innerHTML = `<div class="empty-list-placeholder">No matching redactions in queue.</div>`;
     return;
   }
 
-  container.innerHTML = "";
-  filtered.forEach((r) => {
-    const meta = entityMeta[r.entity_type] || { badge_color: "#475569", label: r.entity_type };
-    const card = document.createElement("div");
-    card.id = `rc-card-${r.id}`;
-    card.className = `redaction-card ${r.enabled ? "" : "disabled-card"} ${
-      state.selectedRedactionId === r.id ? "active-card" : ""
-    }`;
-    card.style.borderLeftColor = meta.badge_color;
+  const exemptions = state.meta.foia_exemptions;
 
-    const exOptions = (state.meta ? state.meta.foia_exemptions : [])
-      .map(
-        (ex) =>
-          `<option value="${ex.code}" ${
-            r.exemption_code === ex.code ? "selected" : ""
-          }>${ex.short_label}</option>`
-      )
-      .join("");
+  for (const r of list) {
+    const typeInfo = state.meta.entity_types[r.entity_type] || {
+      label: r.entity_type,
+      color: "#005691",
+    };
+
+    const card = document.createElement("div");
+    card.className = `redaction-card ${r.enabled ? "" : "disabled-card"}`;
+    card.id = `rc-card-${r.id}`;
+    card.style.borderLeftColor = typeInfo.color;
+
+    const pageNum = r.rects && r.rects[0] ? r.rects[0].page : r.page_number || 1;
+
+    let optionsHtml = "";
+    for (const [code, ex] of Object.entries(exemptions)) {
+      const selected = r.exemption_code === code ? "selected" : "";
+      optionsHtml += `<option value="${code}" ${selected}>${code} — ${ex.title.replace(
+        /^Exemption\s+[^\s—]+\s*—\s*/,
+        ""
+      )}</option>`;
+    }
+
+    // Build word chips so the user can trim words from a multi-word redaction (e.g. remove "Special Agent")
+    const words = (r.text || "").trim().split(/\s+/).filter(Boolean);
+    const hasTitlePrefix = TITLE_PREFIX_REGEX.test(r.text || "");
+    let wordChipsHtml = "";
+    if (words.length > 1) {
+      const chips = words
+        .map(
+          (w, idx) =>
+            `<span class="rc-token-chip" data-word-idx="${idx}" title="Click to exclude '${escapeHtml(
+              w
+            )}' from this redaction">${escapeHtml(w)} ×</span>`
+        )
+        .join("");
+      const stripBtn = hasTitlePrefix
+        ? `<button type="button" class="rc-strip-title-btn" title="Remove leading title/rank and keep only the person's name">Name Only</button>`
+        : "";
+      wordChipsHtml = `
+        <div class="rc-span-adjust-row">
+          <div class="rc-token-chips">${chips}</div>
+          ${stripBtn}
+        </div>
+      `;
+    }
 
     card.innerHTML = `
       <div class="rc-top-row">
-        <label class="rc-check-wrap">
-          <input type="checkbox" class="rc-enable-chk" ${r.enabled ? "checked" : ""} />
-          <span class="rc-text-value" title="${escapeHtml(r.text)}">${escapeHtml(r.text)}</span>
-        </label>
-        <button type="button" class="rc-delete-btn" title="Remove Redaction">&times;</button>
+        <div class="rc-check-wrap">
+          <input type="checkbox" class="rc-toggle-chk" ${r.enabled ? "checked" : ""} title="Enable/Disable redaction" />
+          <input
+            type="text"
+            class="rc-text-input"
+            value="${escapeHtml(r.text)}"
+            title="Edit exact text to redact (press Enter or click outside to apply)"
+            aria-label="Redacted text span"
+          />
+        </div>
+        <button class="rc-delete-btn" title="Remove from queue" aria-label="Remove redaction">${SVG_ICONS.close}</button>
       </div>
+      ${wordChipsHtml}
       <div class="rc-meta-row">
-        <span class="rc-type-badge" style="background:${meta.bg_color}; color:#fff; border:1px solid ${meta.border_color}">
-          ${escapeHtml(r.entity_type)} · P${r.page_number || 1}
-        </span>
-        <select class="select-control rc-exemption-select" title="Assign FOIA Statutory Exemption">
-          ${exOptions}
+        <span class="rc-type-badge" style="border-left: 3px solid ${typeInfo.color}">${typeInfo.label}</span>
+        <span>Page ${pageNum} · ${r.source === "manual" ? "Manual" : `${Math.round((r.score || r.confidence || 0.9) * 100)}% conf`}</span>
+      </div>
+      <div class="rc-controls-row">
+        <select class="select-control select-sm rc-exemption-select" aria-label="FOIA Exemption">
+          ${optionsHtml}
         </select>
+        <input type="text" class="input-sm rc-comment-input" placeholder="Optional Vaughn justification note..." value="${escapeHtml(
+          r.comment || ""
+        )}" />
       </div>
     `;
 
-    // Toggle enabled
-    card.querySelector(".rc-enable-chk").addEventListener("change", async (e) => {
-      await updateSingleRedaction(r.id, { enabled: e.target.checked });
+    card.querySelector(".rc-toggle-chk").addEventListener("change", async (e) => {
+      r.enabled = e.target.checked;
+      await syncRedactionsToServer();
     });
 
-    // Change exemption code
-    card.querySelector(".rc-exemption-select").addEventListener("change", async (e) => {
-      await updateSingleRedaction(r.id, { exemption_code: e.target.value });
-    });
-
-    // Delete item
-    card.querySelector(".rc-delete-btn").addEventListener("click", async () => {
-      await deleteRedaction(r.id);
-    });
-
-    // Click card to focus page on PDF
-    card.addEventListener("click", (e) => {
-      if (["INPUT", "SELECT", "BUTTON", "OPTION"].includes(e.target.tagName)) return;
-      state.selectedRedactionId = r.id;
-      if (state.doc.file_type === "pdf" && r.page_number && r.page_number !== state.currentPage) {
-        state.currentPage = r.page_number;
-        renderVisualPage();
+    // Direct inline text editing to adjust redaction length
+    const textInput = card.querySelector(".rc-text-input");
+    const commitTextEdit = async () => {
+      const nextText = textInput.value.trim();
+      if (nextText && nextText !== r.text) {
+        await patchSingleRedaction(r.id, { text: nextText });
       } else {
-        renderPdfBoundingBoxes();
+        textInput.value = r.text;
       }
-      renderRedactionsList();
+    };
+    textInput.addEventListener("change", commitTextEdit);
+    textInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        textInput.blur();
+      }
+    });
+
+    // Clicking a word chip removes that token (or trims from that side)
+    card.querySelectorAll(".rc-token-chip").forEach((chip) => {
+      chip.addEventListener("click", async () => {
+        const idx = parseInt(chip.dataset.wordIdx, 10);
+        if (words.length <= 1) return;
+        let remaining;
+        if (idx === 0) {
+          remaining = words.slice(1);
+        } else if (idx === words.length - 1) {
+          remaining = words.slice(0, -1);
+        } else {
+          // If clicking an interior prefix word (like "Agent" in "Special Agent Valerie M. Sterling"),
+          // drop everything up to and including idx if idx < words.length / 2, else drop from idx onward
+          remaining = idx < words.length / 2 ? words.slice(idx + 1) : words.slice(0, idx);
+        }
+        const updatedText = remaining.join(" ").trim();
+        if (updatedText) {
+          await patchSingleRedaction(r.id, { text: updatedText });
+        }
+      });
+    });
+
+    // Quick "Name Only" button for titles/ranks
+    const stripTitleBtn = card.querySelector(".rc-strip-title-btn");
+    if (stripTitleBtn) {
+      stripTitleBtn.addEventListener("click", async () => {
+        const stripped = (r.text || "").replace(TITLE_PREFIX_REGEX, "").trim();
+        if (stripped && stripped !== r.text) {
+          await patchSingleRedaction(r.id, { text: stripped });
+        }
+      });
+    }
+
+    card.querySelector(".rc-delete-btn").addEventListener("click", async () => {
+      const res = await fetch(`/api/documents/${state.doc.doc_id}/redactions/${r.id}`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        state.doc = await res.json();
+        renderAllPanels();
+      }
+    });
+
+    card.querySelector(".rc-exemption-select").addEventListener("change", async (e) => {
+      r.exemption_code = e.target.value;
+      await syncRedactionsToServer();
+    });
+
+    card.querySelector(".rc-comment-input").addEventListener("change", async (e) => {
+      r.comment = e.target.value;
+      await syncRedactionsToServer();
+    });
+
+    card.addEventListener("mouseenter", () => {
+      state.highlightedRedactionId = r.id;
+      document.querySelectorAll(`.bbox-overlay[data-redaction-id="${r.id}"]`).forEach((el) => {
+        el.classList.add("highlighted");
+      });
+    });
+
+    card.addEventListener("mouseleave", () => {
+      state.highlightedRedactionId = null;
+      document.querySelectorAll(`.bbox-overlay[data-redaction-id="${r.id}"]`).forEach((el) => {
+        el.classList.remove("highlighted");
+      });
     });
 
     container.appendChild(card);
-  });
-}
-
-function scrollToRedactionCard(redactionId) {
-  const el = document.getElementById(`rc-card-${redactionId}`);
-  if (el) {
-    el.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 }
 
-async function reanalyzeCurrentDocument() {
+function highlightCardInQueue(redactionId, active) {
+  const card = document.getElementById(`rc-card-${redactionId}`);
+  if (!card) return;
+  card.classList.toggle("active-card", active);
+  if (active) {
+    card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+}
+
+// ==================== VAUGHN INDEX TABLE ====================
+
+function renderVaughnIndexTable() {
   if (!state.doc) return;
-  const enabledTypes = [];
-  const entityExemptions = {};
-  Object.entries(state.detectorConfig).forEach(([et, cfg]) => {
-    if (cfg.enabled) enabledTypes.push(et);
-    entityExemptions[et] = cfg.exemption;
-  });
-
-  const minConfidence = parseFloat(document.getElementById("confidence-slider").value || "0.45");
-
-  const res = await fetch(`/api/documents/${state.doc.doc_id}/reanalyze`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      enabled_types: enabledTypes,
-      default_exemption: "(b)(6)",
-      entity_exemptions: entityExemptions,
-      min_confidence: minConfidence,
-      preserve_manual: true,
-    }),
-  });
-
-  if (res.ok) {
-    state.doc = await res.json();
-    refreshAllPanels();
-  }
-}
-
-async function submitManualTextRedaction() {
-  if (!state.doc) return;
-  const textInput = document.getElementById("manual-text-input");
-  const text = textInput.value.trim();
-  if (!text) return;
-
-  const entityType = document.getElementById("manual-entity-select").value;
-  const exemptionCode = document.getElementById("manual-exemption-select").value;
-  const comment = document.getElementById("manual-comment-input").value.trim();
-  const applyAll = document.getElementById("manual-all-occurrences").checked;
-
-  await addManualTextRedactionRequest({
-    text,
-    entity_type: entityType,
-    exemption_code: exemptionCode,
-    comment,
-    apply_all_occurrences: applyAll,
-    page_number: state.currentPage,
-  });
-
-  textInput.value = "";
-  document.getElementById("manual-comment-input").value = "";
-}
-
-async function addManualTextRedactionRequest(payload) {
-  const res = await fetch(`/api/documents/${state.doc.doc_id}/redactions/manual-text`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (res.ok) {
-    state.doc = await res.json();
-    refreshAllPanels();
-  }
-}
-
-async function updateSingleRedaction(redactionId, patch) {
-  const res = await fetch(`/api/documents/${state.doc.doc_id}/redactions/${redactionId}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(patch),
-  });
-  if (res.ok) {
-    state.doc = await res.json();
-    refreshAllPanels();
-  }
-}
-
-async function bulkUpdateRedactions(payload) {
-  const res = await fetch(`/api/documents/${state.doc.doc_id}/redactions/bulk-update`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (res.ok) {
-    state.doc = await res.json();
-    refreshAllPanels();
-  }
-}
-
-async function deleteRedaction(redactionId) {
-  const res = await fetch(`/api/documents/${state.doc.doc_id}/redactions/${redactionId}`, {
-    method: "DELETE",
-  });
-  if (res.ok) {
-    state.doc = await res.json();
-    refreshAllPanels();
-  }
-}
-
-async function executeBurnAndExport(switchToBurnedTab = true) {
-  if (!state.doc) return;
-  const stampExemption = document.getElementById("chk-stamp-exemption").checked;
-
-  const res = await fetch(`/api/documents/${state.doc.doc_id}/export`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      include_exemption_stamp: stampExemption,
-      redaction_style: "black_box_with_exemption",
-    }),
-  });
-
-  if (!res.ok) {
-    alert("Failed to apply final redactions.");
-    return;
-  }
-
-  const summary = await res.json();
-
-  // Populate download dock links
-  const dlGrid = document.getElementById("download-buttons-grid");
-  dlGrid.classList.remove("hidden");
-
-  const docId = state.doc.doc_id;
-  document.getElementById("dl-primary-btn").href = `/api/documents/${docId}/download/primary`;
-  document.getElementById("dl-pdf-btn").href = `/api/documents/${docId}/download/pdf`;
-  document.getElementById("dl-vaughn-pdf-btn").href = `/api/documents/${docId}/download/vaughn_pdf`;
-  document.getElementById("dl-vaughn-csv-btn").href = `/api/documents/${docId}/download/vaughn_csv`;
-
-  // Populate Burned Preview tab
-  const verBanner = document.getElementById("verification-banner");
-  const v = summary.verification;
-  verBanner.innerHTML = `
-    <div>
-      <strong>✔ IRREVERSIBLE SANITIZATION VERIFIED:</strong> ${escapeHtml(v.audit_message)}
-    </div>
-    <span class="airgap-pill">0 Residual PII Leaks · Metadata Purged</span>
-  `;
-
-  const burnedImg = document.getElementById("burned-pdf-img");
-  burnedImg.src = `/api/documents/${docId}/redacted-page/${state.currentPage}/image?dpi=150&t=${Date.now()}`;
-
-  // Fetch sanitized text preview
-  const txtRes = await fetch(`/api/documents/${docId}/download/txt`);
-  if (txtRes.ok) {
-    const sanitizedText = await txtRes.text();
-    document.getElementById("burned-text-preview").textContent = sanitizedText;
-  }
-
-  // Populate Vaughn Index table
   const tbody = document.getElementById("vaughn-table-body");
   tbody.innerHTML = "";
-  (summary.vaughn_index || []).forEach((entry) => {
+
+  const active = (state.doc.redactions || []).filter((r) => r.enabled);
+  const exemptions = state.meta.foia_exemptions;
+
+  active.forEach((r, idx) => {
+    const ex = exemptions[r.exemption_code] || {
+      statute: "5 U.S.C. § 552",
+      vaughn_rationale: "Redacted pursuant to FOIA statutory exemption.",
+    };
+    const typeInfo = state.meta.entity_types[r.entity_type] || { label: r.entity_type };
+    const pages = Array.from(new Set((r.rects || []).map((rc) => rc.page))).join(", ") || r.page_number || "1";
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td><strong>#${entry.item_number}</strong></td>
-      <td>Page ${entry.page_number}</td>
-      <td>${escapeHtml(entry.information_withheld_category)}</td>
-      <td><span class="badge-tag">${escapeHtml(entry.exemption_code)}</span></td>
-      <td><code>${escapeHtml(entry.statutory_citation)}</code></td>
-      <td>${escapeHtml(entry.approximate_length)}</td>
-      <td>${escapeHtml(entry.detection_method)}</td>
-      <td>${escapeHtml(entry.statutory_justification)}</td>
+      <td class="mono-val">${idx + 1}</td>
+      <td class="mono-val">p. ${pages}</td>
+      <td><strong>${escapeHtml(typeInfo.label)}</strong></td>
+      <td><span class="exemption-code-badge">${escapeHtml(r.exemption_code)}</span></td>
+      <td class="mono-val">${escapeHtml(ex.statute)}</td>
+      <td class="mono-val">${(r.text || "").length} chars</td>
+      <td>${r.source === "manual" ? "Analyst Manual" : "Auto NER/Regex"}</td>
+      <td>${escapeHtml(r.comment ? `${ex.vaughn_rationale} (${r.comment})` : ex.vaughn_rationale)}</td>
     `;
     tbody.appendChild(tr);
   });
+}
 
-  if (switchToBurnedTab) {
-    await switchView("burned");
+// ==================== BURN REDACTIONS & FINAL EXPORT ====================
+
+async function executeBurnAndExport(switchToBurnedTab = true) {
+  if (!state.doc || !state.doc.doc_id) return;
+  setLoadingState(true, "Permanently burning redactions & generating Vaughn Index...");
+  try {
+    const stampExemption = document.getElementById("chk-stamp-exemption").checked;
+    const res = await fetch(`/api/documents/${state.doc.doc_id}/export`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        include_exemption_stamp: stampExemption,
+        include_exemption_labels: stampExemption,
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert(`Export failed: ${err.detail || res.statusText}`);
+      return;
+    }
+
+    const result = await res.json();
+    state.lastExportResult = result;
+
+    // Populate Download Dock
+    const dlGrid = document.getElementById("download-buttons-grid");
+    dlGrid.classList.remove("hidden");
+
+    const dlPrimary = document.getElementById("dl-primary-btn");
+    dlPrimary.href = result.downloads.primary;
+    dlPrimary.innerHTML = `${SVG_ICONS.download} <span>Redacted (${(state.doc.ext || ".pdf").toUpperCase().replace(".", "")})</span>`;
+
+    document.getElementById("dl-pdf-btn").href = result.downloads.redacted_pdf;
+    document.getElementById("dl-vaughn-pdf-btn").href = result.downloads.vaughn_pdf;
+    document.getElementById("dl-vaughn-csv-btn").href = result.downloads.vaughn_csv;
+
+    if (switchToBurnedTab) {
+      await switchView("burned");
+    } else {
+      renderBurnedPreview();
+    }
+  } finally {
+    setLoadingState(false);
+  }
+}
+
+function renderBurnedPreview() {
+  if (!state.lastExportResult || !state.doc || !state.doc.doc_id) return;
+  const v = state.lastExportResult.verification || {};
+  const banner = document.getElementById("verification-banner");
+  const totalBurned =
+    v.total_redactions_burned ??
+    state.lastExportResult.total_redactions_applied ??
+    (state.doc.redactions || []).filter((r) => r.enabled).length;
+
+  banner.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span style="color:var(--color-positive);display:inline-flex;">${SVG_ICONS.check}</span>
+      <div>
+        <strong>Irreversible Sanitization Verified:</strong>
+        ${totalBurned} redaction(s) permanently burned into document stream.
+        Underlying characters and image pixels have been physically excised from the output file.
+      </div>
+    </div>
+  `;
+
+  const burnedImg = document.getElementById("burned-pdf-img");
+  burnedImg.src = `/api/documents/${state.doc.doc_id}/redacted-page/${state.currentPage}/image?t=${Date.now()}`;
+
+  document.getElementById("burned-text-preview").textContent =
+    state.lastExportResult.sanitized_text_preview || "";
+}
+
+// ==================== UTILITIES ====================
+
+function setLoadingState(isLoading, msg = "Processing...") {
+  const btnExport = document.getElementById("btn-finalize-export");
+  const btnReanalyze = document.getElementById("btn-reanalyze");
+  if (isLoading) {
+    btnExport.disabled = true;
+    btnExport.innerHTML = `<span>${escapeHtml(msg)}</span>`;
+    btnReanalyze.disabled = true;
+  } else {
+    if (state.doc) {
+      btnExport.disabled = false;
+      btnReanalyze.disabled = false;
+    }
+    btnExport.innerHTML = `${SVG_ICONS.lock} <span>Burn Redactions &amp; Export</span>`;
   }
 }
 
@@ -960,4 +1242,13 @@ function escapeHtml(str) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function hexToRgba(hex, alpha) {
+  const clean = (hex || "#005691").replace("#", "");
+  const bigint = parseInt(clean, 16);
+  const r = (bigint >> 16) & 255;
+  const g = (bigint >> 8) & 255;
+  const b = bigint & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }

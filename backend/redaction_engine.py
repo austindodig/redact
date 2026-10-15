@@ -5,13 +5,23 @@ Google libphonenumber (phonenumbers), and Federal FOIA deterministic regex recog
 Runs 100% locally with zero external network calls.
 """
 
+import os
 import re
 import uuid
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
+
+# Ensure tldextract uses a local workspace cache and bundled offline PSL snapshot
+os.environ.setdefault("TLDEXTRACT_CACHE", str(Path(__file__).resolve().parent.parent / "storage" / ".tld_cache"))
+
 import phonenumbers
 import spacy
+import tldextract
 from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
+
+# Force tldextract (used by Presidio's EmailRecognizer) to use its bundled offline snapshot with zero network calls
+tldextract.tldextract.TLD_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
 
 from .foia_exemptions import ENTITY_TYPE_META
 
@@ -382,6 +392,26 @@ class OfflineRedactionEngine:
 
         return True
 
+    def strip_honorific_prefix(self, text_span: str) -> Tuple[str, int]:
+        """
+        Strips leading honorific/role titles (e.g., 'Special Agent ', 'Dr. ', 'Supervisory Special Agent ')
+        from a detected PERSON span and returns `(trimmed_text, chars_stripped_from_left)`.
+        """
+        pattern = re.compile(
+            r"^(?:(?:Supervisory\s+Special\s+Agent|Special\s+Agent|Senior\s+Analyst|FOIA\s+Officer|"
+            r"Assistant\s+Inspector\s+General|Deputy\s+Director|Branch\s+Chief|Section\s+Chief|"
+            r"General\s+Counsel|Investigator|Inspector|Auditor|Attorney|Counsel|Director|Agent|Officer|"
+            + HONORIFIC_PREFIXES
+            + r")\s+)+",
+            re.IGNORECASE,
+        )
+        m = pattern.match(text_span)
+        if m:
+            remainder = text_span[m.end():]
+            if len(remainder.strip()) >= 2:
+                return remainder, m.end()
+        return text_span, 0
+
     def analyze_text(
         self,
         text: str,
@@ -389,6 +419,7 @@ class OfflineRedactionEngine:
         default_exemption: str = "(b)(6)",
         entity_exemptions: Optional[Dict[str, str]] = None,
         min_confidence: float = 0.45,
+        strip_titles: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Runs full hybrid detection on `text` and returns de-duplicated, non-overlapping spans
@@ -489,6 +520,16 @@ class OfflineRedactionEngine:
         final_items: List[Dict[str, Any]] = []
         for item in merged:
             etype = item["entity_type"]
+            span_start = item["start"]
+            span_end = item["end"]
+            span_text = item["text"]
+
+            if strip_titles and etype == "PERSON":
+                trimmed_text, offset_delta = self.strip_honorific_prefix(span_text)
+                if offset_delta > 0:
+                    span_start += offset_delta
+                    span_text = trimmed_text
+
             meta = ENTITY_TYPE_META.get(etype, ENTITY_TYPE_META["CUSTOM"])
             exemption = (
                 entity_exemptions.get(etype)
@@ -497,9 +538,9 @@ class OfflineRedactionEngine:
             )
             final_items.append({
                 "id": f"red-{uuid.uuid4().hex[:10]}",
-                "start": item["start"],
-                "end": item["end"],
-                "text": item["text"],
+                "start": span_start,
+                "end": span_end,
+                "text": span_text,
                 "entity_type": etype,
                 "entity_label": meta["label"],
                 "exemption_code": exemption,

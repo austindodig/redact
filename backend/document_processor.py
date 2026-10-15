@@ -1,12 +1,14 @@
 """
-Document Ingestion, Offline Tesseract OCR Pipeline, Coordinate Mapping, & Irreversible Redaction Processor.
+Document Ingestion, Pure-Pip Offline Neural OCR Pipeline (RapidOCR + ONNXRuntime),
+Coordinate Mapping, & Irreversible Redaction Processor.
+
 Supports:
   - Native & Scanned PDFs (.pdf): PyMuPDF (fitz) text extraction. Any page without selectable text
-    is automatically run through local Tesseract OCR (`pytesseract.image_to_pdf_or_hocr`) to build
-    a searchable/coordinate-mapped PDF layer while preserving the scanned raster image, so both the
-    OCR text layer AND the underlying scanned image pixels are physically destroyed upon redaction.
+    is automatically run through our pure-pip `rapidocr-onnxruntime` neural OCR engine (zero OS-level
+    binary dependencies) to build a coordinate-aligned invisible PDF text layer over the scanned image.
+    Upon redaction, both the OCR text layer AND the underlying scanned image pixels are physically destroyed.
   - Scanned Document Images (.png, .jpg, .jpeg, .tif, .tiff, .bmp, .webp): Automatically converted
-    into a single- or multi-page OCR'd PDF via local Tesseract OCR, allowing full interactive bounding-box
+    into a single- or multi-page OCR'd PDF via RapidOCR + PyMuPDF, allowing full interactive bounding-box
     review and pixel-level redaction.
   - Word (.docx): python-docx paragraph/table/header/footer extraction, physical XML replacement,
     core_properties metadata scrubbing, plus PDF conversion via ReportLab + PyMuPDF true redaction.
@@ -26,8 +28,9 @@ from typing import Dict, List, Any, Optional, Tuple
 
 import fitz  # PyMuPDF
 import docx
-import pytesseract
+import numpy as np
 from PIL import Image, ImageOps
+from rapidocr_onnxruntime import RapidOCR
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas as rl_canvas
 
@@ -47,6 +50,8 @@ class DocumentProcessor:
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.outputs_dir.mkdir(parents=True, exist_ok=True)
         self.engine = OfflineRedactionEngine()
+        # Pure-pip neural OCR engine (RapidOCR + ONNXRuntime, 100% bundled in Python wheels)
+        self.ocr_engine = RapidOCR()
 
     def ingest_document(self, filename: str, file_bytes: bytes, force_ocr: bool = False) -> Dict[str, Any]:
         doc_id = f"doc-{uuid.uuid4().hex[:12]}"
@@ -69,33 +74,72 @@ class DocumentProcessor:
         else:
             doc_data = self._extract_text(doc_id, filename, upload_path, ext)
 
-        # Run initial automatic PII & FOIA detection
         redactions = self.detect_redactions(doc_data)
         doc_data["redactions"] = redactions
         return doc_data
 
     def _ocr_pil_image_to_pdf_bytes(self, pil_img: Image.Image) -> bytes:
         """
-        Preprocesses a scanned page/image and runs local Tesseract OCR (`image_to_pdf_or_hocr`)
-        to produce a single-page PDF containing both the original raster scan image AND an
-        aligned, coordinate-mapped OCR text layer.
+        Preprocesses a scanned page/image and runs our pure-pip `rapidocr-onnxruntime` neural OCR
+        engine to produce a single-page PDF containing both the original raster scan image AND an
+        aligned, coordinate-mapped invisible PDF text layer (`render_mode=3`).
         """
-        if pil_img.mode not in ("RGB", "L"):
+        if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        # Slight auto-contrast normalization helps noisy grayscale/color scans
         processed = ImageOps.autocontrast(pil_img, cutoff=1)
-        pdf_bytes = pytesseract.image_to_pdf_or_hocr(
-            processed,
-            extension="pdf",
-            lang="eng",
-            config="--oem 3 --psm 3",
-        )
+        w, h = processed.size
+
+        img_np = np.array(processed)
+        ocr_results, _ = self.ocr_engine(img_np, box_thresh=0.3, unclip_ratio=1.8)
+
+        img_buf = io.BytesIO()
+        processed.save(img_buf, format="PNG")
+        png_bytes = img_buf.getvalue()
+
+        doc = fitz.open()
+        page = doc.new_page(width=float(w), height=float(h))
+        page.insert_image(page.rect, stream=png_bytes)
+
+        if ocr_results:
+            for box, text, _score in ocr_results:
+                if not text or not text.strip():
+                    continue
+                xs = [float(pt[0]) for pt in box]
+                ys = [float(pt[1]) for pt in box]
+                x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+                box_h = max(y1 - y0, 8.0)
+                box_w = max(x1 - x0, 10.0)
+
+                unit_len = fitz.get_text_length(text, fontname="helv", fontsize=1.0)
+                fontsize = box_w / max(unit_len, 0.1)
+                fontsize = min(max(fontsize, 4.0), box_h * 0.95)
+
+                page.insert_text(
+                    fitz.Point(x0, y1 - (box_h * 0.18)),
+                    text,
+                    fontsize=fontsize,
+                    fontname="helv",
+                    render_mode=3,
+                )
+
+        pdf_bytes = doc.tobytes(garbage=3, deflate=True)
+        doc.close()
         return pdf_bytes
+
+    def _ocr_image_to_text(self, pil_img: Image.Image) -> str:
+        """Runs pure-pip RapidOCR on a cropped image region and returns the recognized text."""
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+        img_np = np.array(pil_img)
+        ocr_results, _ = self.ocr_engine(img_np, box_thresh=0.3, unclip_ratio=1.8)
+        if not ocr_results:
+            return ""
+        return " ".join(text.strip() for _box, text, _score in ocr_results if text and text.strip())
 
     def _extract_scanned_image(self, doc_id: str, filename: str, image_path: Path) -> Dict[str, Any]:
         """
         Converts a single- or multi-frame scanned image (.png, .jpg, .tiff, etc.) into
-        a searchable OCR PDF on disk using local Tesseract, then extracts text & coordinates.
+        a searchable OCR PDF on disk using pure-pip RapidOCR, then extracts text & coordinates.
         """
         img = Image.open(str(image_path))
         merged_pdf = fitz.open()
@@ -129,7 +173,7 @@ class DocumentProcessor:
     ) -> Dict[str, Any]:
         """
         Opens a PDF and inspects each page. If a page has fewer than 15 selectable characters
-        (indicating a scanned image-only page) or `force_ocr=True`, runs local Tesseract OCR
+        (indicating a scanned image-only page) or `force_ocr=True`, runs pure-pip RapidOCR
         on that page and replaces the page in a working PDF copy so that `page.search_for()`
         and `page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)` work seamlessly.
         """
@@ -147,7 +191,6 @@ class DocumentProcessor:
 
             if needs_ocr:
                 try:
-                    # Render page at 200 DPI for high-accuracy Tesseract OCR
                     pix = page.get_pixmap(dpi=200, alpha=False)
                     pil_img = Image.open(io.BytesIO(pix.tobytes("png")))
                     ocr_pdf_bytes = self._ocr_pil_image_to_pdf_bytes(pil_img)
@@ -166,14 +209,12 @@ class DocumentProcessor:
 
         orig_doc.close()
 
-        # If any page was upgraded with an OCR text layer, save the OCR-augmented working PDF
         working_pdf_path = path
         if any_page_ocred:
             working_pdf_path = self.uploads_dir / f"{doc_id}_working_ocr.pdf"
             rebuilt_doc.save(str(working_pdf_path), garbage=3, deflate=True)
         rebuilt_doc.close()
 
-        # Now extract text and character offsets from the working PDF
         pdf_doc = fitz.open(str(working_pdf_path))
         pages_meta: List[Dict[str, Any]] = []
         full_text_parts: List[str] = []
@@ -295,10 +336,6 @@ class DocumentProcessor:
         }
 
     def force_ocr_on_document(self, doc_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Forces full local Tesseract OCR across all pages of an existing PDF document
-        (useful for hybrid PDFs with degraded/corrupted embedded fonts or partial scans).
-        """
         if doc_data["file_type"] != "pdf":
             raise ValueError("Force OCR is only applicable to PDF or Scanned Image documents.")
         orig_path = Path(doc_data.get("original_upload_path") or doc_data["upload_path"])
@@ -314,6 +351,7 @@ class DocumentProcessor:
         default_exemption: str = "(b)(6)",
         entity_exemptions: Optional[Dict[str, str]] = None,
         min_confidence: float = 0.45,
+        strip_titles: bool = False,
     ) -> List[Dict[str, Any]]:
         full_text = doc_data.get("full_text", "")
         detected = self.engine.analyze_text(
@@ -322,6 +360,7 @@ class DocumentProcessor:
             default_exemption=default_exemption,
             entity_exemptions=entity_exemptions,
             min_confidence=min_confidence,
+            strip_titles=strip_titles,
         )
 
         if doc_data["file_type"] == "pdf":
@@ -332,6 +371,15 @@ class DocumentProcessor:
                 item["bboxes"] = []
 
         return detected
+
+    def recalculate_single_or_dirty_bboxes(
+        self, doc_data: Dict[str, Any], redactions: List[Dict[str, Any]]
+    ) -> None:
+        if doc_data["file_type"] != "pdf":
+            return
+        dirty = [r for r in redactions if not r.get("bboxes")]
+        if dirty:
+            self._attach_pdf_coordinates(doc_data, dirty)
 
     def _attach_pdf_coordinates(self, doc_data: Dict[str, Any], redactions: List[Dict[str, Any]]) -> None:
         pdf_doc = fitz.open(doc_data["upload_path"])
@@ -361,8 +409,6 @@ class DocumentProcessor:
                     if part.strip():
                         rects.extend(page.search_for(part.strip()))
 
-            # For OCR pages where multi-word spacing might slightly differ across word boxes,
-            # union individual word rects if full-phrase search_for returns empty
             if not rects and " " in search_str:
                 words = [w for w in search_str.split() if len(w) >= 2]
                 if words:
@@ -407,7 +453,6 @@ class DocumentProcessor:
             pdf_doc.close()
             raise ValueError(f"Page number {page_number} out of range.")
         page = pdf_doc[page_number - 1]
-        # Render page at target width (~1200px wide) regardless of underlying OCR DPI
         zoom = 1200.0 / max(page.rect.width, 1.0)
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -428,13 +473,11 @@ class DocumentProcessor:
         clip_rect = fitz.Rect(x0, y0, x1, y1)
         extracted = page.get_text("text", clip=clip_rect).strip()
 
-        # If user drew a box over a handwritten note or low-contrast area on a scan that had no text,
-        # attempt targeted crop OCR with Tesseract
         if not extracted:
             try:
                 pix = page.get_pixmap(clip=clip_rect, dpi=250, alpha=False)
                 crop_img = Image.open(io.BytesIO(pix.tobytes("png")))
-                ocr_crop = pytesseract.image_to_string(crop_img, lang="eng").strip()
+                ocr_crop = self._ocr_image_to_text(crop_img)
                 if ocr_crop:
                     extracted = ocr_crop
             except Exception:
@@ -561,12 +604,25 @@ class DocumentProcessor:
         outputs["vaughn_json"] = str(vaughn_json_path)
         outputs["vaughn_pdf"] = str(vaughn_pdf_path)
 
+        verification["total_redactions_burned"] = len(active_redactions)
+
+        downloads = {
+            "primary": f"/api/documents/{doc_id}/download/primary",
+            "redacted_pdf": f"/api/documents/{doc_id}/download/pdf",
+            "redacted_txt": f"/api/documents/{doc_id}/download/txt",
+            "vaughn_csv": f"/api/documents/{doc_id}/download/vaughn_csv",
+            "vaughn_pdf": f"/api/documents/{doc_id}/download/vaughn_pdf",
+            "vaughn_json": f"/api/documents/{doc_id}/download/vaughn_json",
+        }
+
         result_summary = {
             "doc_id": doc_id,
             "filename": doc_data["filename"],
             "processed_at": datetime.now(timezone.utc).isoformat(),
             "total_redactions_applied": len(active_redactions),
             "outputs": outputs,
+            "downloads": downloads,
+            "sanitized_text_preview": redacted_txt,
             "verification": verification,
             "vaughn_index": vaughn_entries,
         }
@@ -581,18 +637,13 @@ class DocumentProcessor:
         include_exemption_stamp: bool = True,
         redaction_style: str = "black_box_with_exemption",
     ) -> None:
-        """
-        Uses PyMuPDF's `add_redact_annot` + `apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)`
-        to permanently excise both the OCR/native text layer AND the underlying scanned image pixels
-        inside every redaction box.
-        """
         pdf_doc = fitz.open(str(input_pdf_path))
 
         if redaction_style == "white_box_with_exemption":
             fill_color = (0.96, 0.96, 0.96)
             text_color = (0.05, 0.05, 0.05)
         else:
-            fill_color = (0.04, 0.06, 0.10)
+            fill_color = (0.08, 0.09, 0.12)
             text_color = (1.0, 1.0, 1.0)
 
         by_page: Dict[int, List[Dict[str, Any]]] = {}
@@ -604,7 +655,6 @@ class DocumentProcessor:
             page_num = page_idx + 1
             page = pdf_doc[page_idx]
             pw, ph = page.rect.width, page.rect.height
-            # Scale font size proportionally if page is high-DPI OCR canvas
             scale_factor = pw / 612.0
             font_sz = max(7.5, round(7.5 * scale_factor, 1))
             pad_x = max(1.0, 1.5 * scale_factor)
@@ -653,7 +703,6 @@ class DocumentProcessor:
                         text_color=text_color,
                     )
 
-            # Permanently apply redactions: removes text from content stream AND blanks out scanned image pixels!
             page.apply_redactions(
                 images=fitz.PDF_REDACT_IMAGE_PIXELS,
             )
@@ -663,7 +712,7 @@ class DocumentProcessor:
             "author": "",
             "subject": "Released pursuant to 5 U.S.C. § 552 (FOIA)",
             "keywords": "",
-            "creator": "Federal Offline FOIA Redaction Workbench",
+            "creator": "Document Redactor",
             "producer": "PyMuPDF Content-Stream & Pixel Sanitizer",
         })
         try:
@@ -736,7 +785,7 @@ class DocumentProcessor:
                 continue
             seen.add(target)
             ex = r.get("exemption_code", "(b)(6)")
-            stamp = f"█ [REDACTED {ex}] █" if include_exemption_stamp else "█ [REDACTED] █"
+            stamp = f"[REDACTED {ex}]" if include_exemption_stamp else "[REDACTED]"
             replacements.append((target, stamp))
 
         def sanitize_paragraph(para):
@@ -783,7 +832,7 @@ class DocumentProcessor:
 
         cp = d.core_properties
         cp.author = "FOIA Release Authority"
-        cp.last_modified_by = "FOIA Redaction Engine"
+        cp.last_modified_by = "Document Redactor"
         cp.comments = "Sanitized pursuant to 5 U.S.C. § 552"
         cp.title = "FOIA Redacted Document"
         cp.subject = "FOIA Release"
@@ -864,7 +913,7 @@ class DocumentProcessor:
                         fontname="helv",
                         fontsize=7.5,
                         align=fitz.TEXT_ALIGN_CENTER,
-                        fill=(0.04, 0.06, 0.10),
+                        fill=(0.08, 0.09, 0.12),
                         text_color=(1.0, 1.0, 1.0),
                     )
             page.apply_redactions()
@@ -899,7 +948,7 @@ class DocumentProcessor:
                 })
 
         scan_note = (
-            " Both the OCR text layer AND the underlying scanned raster image pixels were physically destroyed."
+            " Both the RapidOCR text layer AND the underlying scanned raster image pixels were physically destroyed."
             if is_scanned
             else ""
         )

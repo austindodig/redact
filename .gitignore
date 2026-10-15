@@ -9,6 +9,7 @@ __pycache__/
 # Runtime storage (uploaded & exported temporary documents)
 storage/uploads/*
 storage/outputs/*
+storage/.tld_cache/
 !storage/uploads/.gitkeep
 !storage/outputs/.gitkeep
 

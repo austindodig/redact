@@ -54,8 +54,12 @@ class ReanalyzeRequest(BaseModel):
     )
     default_exemption: str = Field(default="(b)(6)")
     entity_exemptions: Dict[str, str] = Field(default_factory=dict)
+    type_exemptions: Optional[Dict[str, str]] = None
     min_confidence: float = Field(default=0.45, ge=0.1, le=0.99)
+    score_threshold: Optional[float] = None
     preserve_manual: bool = Field(default=True)
+    force_ocr: bool = Field(default=False)
+    strip_titles: bool = Field(default=False)
 
 
 class UpdateRedactionRequest(BaseModel):
@@ -63,7 +67,14 @@ class UpdateRedactionRequest(BaseModel):
     exemption_code: Optional[str] = None
     entity_type: Optional[str] = None
     text: Optional[str] = None
+    start: Optional[int] = None
+    end: Optional[int] = None
     comment: Optional[str] = None
+    bboxes: Optional[List[Dict[str, Any]]] = None
+
+
+class ReplaceAllRedactionsRequest(BaseModel):
+    redactions: List[Dict[str, Any]]
 
 
 class BulkUpdateRedactionsRequest(BaseModel):
@@ -86,18 +97,26 @@ class AddManualTextRedactionRequest(BaseModel):
 
 class AddManualBoxRedactionRequest(BaseModel):
     page_number: int = 1
-    norm_x: float
-    norm_y: float
-    norm_w: float
-    norm_h: float
+    page: Optional[int] = None
+    norm_x: Optional[float] = None
+    norm_y: Optional[float] = None
+    norm_w: Optional[float] = None
+    norm_h: Optional[float] = None
+    x0: Optional[float] = None
+    y0: Optional[float] = None
+    x1: Optional[float] = None
+    y1: Optional[float] = None
     entity_type: str = "CUSTOM"
     exemption_code: str = "(b)(6)"
     comment: str = ""
+    label: Optional[str] = None
 
 
 class ExportRedactedRequest(BaseModel):
     include_exemption_stamp: bool = True
+    include_exemption_labels: Optional[bool] = None
     redaction_style: str = "black_box_with_exemption"
+    fill_color: Optional[str] = None
 
 
 # -------------------- API Endpoints --------------------
@@ -118,9 +137,9 @@ def get_system_metadata():
     return {
         "offline_mode": True,
         "external_network_calls": False,
-        "nlp_engine": f"Microsoft Presidio + spaCy ({processor.engine.model_name}) + libphonenumber + Tesseract OCR",
+        "nlp_engine": f"Microsoft Presidio + spaCy ({processor.engine.model_name}) + libphonenumber + RapidOCR (ONNX)",
         "pdf_engine": f"PyMuPDF (fitz {fitz.__doc__.split()[1] if fitz.__doc__ else '1.28'}) Content-Stream & Pixel Sanitizer",
-        "ocr_engine": "Tesseract OCR 5.5 (Offline Local Engine)",
+        "ocr_engine": "RapidOCR + ONNXRuntime (100% Pure-Pip Offline Neural OCR)",
         "foia_exemptions": FOIA_EXEMPTIONS,
         "entity_types": ENTITY_TYPE_META,
         "sample_documents": samples,
@@ -188,21 +207,76 @@ def get_pdf_page_image(doc_id: str, page_number: int, dpi: int = 150):
 @app.post("/api/documents/{doc_id}/reanalyze")
 def reanalyze_document(doc_id: str, req: ReanalyzeRequest):
     doc_data = _get_doc_or_404(doc_id)
+    if req.force_ocr and doc_data["file_type"] == "pdf":
+        processor.force_ocr_on_document(doc_data)
+
     manual_items = []
     if req.preserve_manual:
         manual_items = [r for r in doc_data.get("redactions", []) if r.get("source") == "manual"]
+
+    effective_conf = req.score_threshold if req.score_threshold is not None else req.min_confidence
+    effective_exemptions = req.type_exemptions if req.type_exemptions else req.entity_exemptions
 
     auto_items = processor.detect_redactions(
         doc_data=doc_data,
         enabled_types=req.enabled_types,
         default_exemption=req.default_exemption,
-        entity_exemptions=req.entity_exemptions,
-        min_confidence=req.min_confidence,
+        entity_exemptions=effective_exemptions,
+        min_confidence=effective_conf,
+        strip_titles=req.strip_titles,
     )
 
     combined = auto_items + manual_items
     combined.sort(key=lambda r: (r.get("page_number", 1), r.get("start") if r.get("start") is not None else 999999))
     doc_data["redactions"] = combined
+    return _serialize_doc(doc_data)
+
+
+@app.put("/api/documents/{doc_id}/redactions")
+def replace_all_redactions(doc_id: str, req: ReplaceAllRedactionsRequest):
+    doc_data = _get_doc_or_404(doc_id)
+    full_text = doc_data.get("full_text", "")
+    old_map = {r["id"]: r for r in doc_data.get("redactions", []) if "id" in r}
+
+    updated_list: List[Dict[str, Any]] = []
+    needs_bbox_recalc = False
+
+    for r in req.redactions:
+        rid = r.get("id") or f"red-{uuid.uuid4().hex[:10]}"
+        prev = old_map.get(rid, {})
+        old_text = prev.get("text")
+        new_text = (r.get("text") or "").strip()
+
+        # If text was edited/trimmed by the user, update character offsets & PDF bounding boxes
+        if new_text and old_text and new_text != old_text:
+            needs_bbox_recalc = True
+            old_start = prev.get("start")
+            old_end = prev.get("end")
+            if isinstance(old_start, int) and isinstance(old_end, int):
+                # Check if new_text is a substring inside or near the original span
+                win_start = max(0, old_start - 30)
+                win_end = min(len(full_text), old_end + 30)
+                sub_idx = full_text.find(new_text, win_start, win_end)
+                if sub_idx != -1:
+                    r["start"] = sub_idx
+                    r["end"] = sub_idx + len(new_text)
+                else:
+                    global_idx = full_text.find(new_text)
+                    if global_idx != -1:
+                        r["start"] = global_idx
+                        r["end"] = global_idx + len(new_text)
+            r["bboxes"] = []
+            r["rects"] = []
+
+        etype = r.get("entity_type", "CUSTOM")
+        meta = ENTITY_TYPE_META.get(etype, ENTITY_TYPE_META["CUSTOM"])
+        r["entity_label"] = meta["label"]
+        updated_list.append(r)
+
+    if needs_bbox_recalc and doc_data["file_type"] == "pdf":
+        processor.recalculate_single_or_dirty_bboxes(doc_data, updated_list)
+
+    doc_data["redactions"] = updated_list
     return _serialize_doc(doc_data)
 
 
@@ -218,6 +292,9 @@ def update_single_redaction(doc_id: str, redaction_id: str, req: UpdateRedaction
     if not target:
         raise HTTPException(status_code=404, detail="Redaction item not found.")
 
+    full_text = doc_data.get("full_text", "")
+    text_changed = False
+
     if req.enabled is not None:
         target["enabled"] = req.enabled
     if req.exemption_code is not None:
@@ -226,10 +303,38 @@ def update_single_redaction(doc_id: str, redaction_id: str, req: UpdateRedaction
         target["entity_type"] = req.entity_type
         meta = ENTITY_TYPE_META.get(req.entity_type, ENTITY_TYPE_META["CUSTOM"])
         target["entity_label"] = meta["label"]
-    if req.text is not None:
-        target["text"] = req.text
     if req.comment is not None:
         target["comment"] = req.comment
+
+    if req.start is not None and req.end is not None and 0 <= req.start < req.end <= len(full_text):
+        target["start"] = req.start
+        target["end"] = req.end
+        target["text"] = full_text[req.start:req.end]
+        text_changed = True
+    elif req.text is not None and req.text.strip() and req.text.strip() != target.get("text"):
+        new_t = req.text.strip()
+        old_start = target.get("start")
+        old_end = target.get("end")
+        if isinstance(old_start, int) and isinstance(old_end, int):
+            win_s = max(0, old_start - 40)
+            win_e = min(len(full_text), old_end + 40)
+            idx = full_text.find(new_t, win_s, win_e)
+            if idx != -1:
+                target["start"] = idx
+                target["end"] = idx + len(new_t)
+            else:
+                g_idx = full_text.find(new_t)
+                if g_idx != -1:
+                    target["start"] = g_idx
+                    target["end"] = g_idx + len(new_t)
+        target["text"] = new_t
+        text_changed = True
+
+    if req.bboxes is not None:
+        target["bboxes"] = req.bboxes
+    elif text_changed and doc_data["file_type"] == "pdf":
+        target["bboxes"] = []
+        processor.recalculate_single_or_dirty_bboxes(doc_data, [target])
 
     return _serialize_doc(doc_data)
 
@@ -258,6 +363,7 @@ def delete_redaction(doc_id: str, redaction_id: str):
 
 
 @app.post("/api/documents/{doc_id}/redactions/manual-text")
+@app.post("/api/documents/{doc_id}/manual-text")
 def add_manual_text_redaction(doc_id: str, req: AddManualTextRedactionRequest):
     doc_data = _get_doc_or_404(doc_id)
     phrase = req.text.strip()
@@ -351,13 +457,30 @@ def add_manual_text_redaction(doc_id: str, req: AddManualTextRedactionRequest):
 
 
 @app.post("/api/documents/{doc_id}/redactions/manual-box")
+@app.post("/api/documents/{doc_id}/manual-box")
 def add_manual_box_redaction(doc_id: str, req: AddManualBoxRedactionRequest):
     doc_data = _get_doc_or_404(doc_id)
     if doc_data["file_type"] != "pdf":
         raise HTTPException(status_code=400, detail="Bounding-box drawing is only supported on PDF documents.")
 
+    page_num = req.page if req.page is not None else req.page_number
+    pages_meta = doc_data.get("pages", [])
+    p_meta = next((p for p in pages_meta if p.get("page_number") == page_num), pages_meta[0] if pages_meta else {"width": 612.0, "height": 792.0})
+    pw = float(p_meta.get("width") or 612.0)
+    ph = float(p_meta.get("height") or 792.0)
+
+    if req.norm_x is not None and req.norm_y is not None and req.norm_w is not None and req.norm_h is not None:
+        nx, ny, nw, nh = req.norm_x, req.norm_y, req.norm_w, req.norm_h
+    elif req.x0 is not None and req.y0 is not None and req.x1 is not None and req.y1 is not None:
+        nx = req.x0 / pw
+        ny = req.y0 / ph
+        nw = (req.x1 - req.x0) / pw
+        nh = (req.y1 - req.y0) / ph
+    else:
+        raise HTTPException(status_code=400, detail="Box coordinates required.")
+
     extracted_text, bbox = processor.extract_text_in_pdf_box(
-        doc_data, req.page_number, req.norm_x, req.norm_y, req.norm_w, req.norm_h
+        doc_data, page_num, nx, ny, nw, nh
     )
     meta = ENTITY_TYPE_META.get(req.entity_type, ENTITY_TYPE_META["CUSTOM"])
 
@@ -370,11 +493,12 @@ def add_manual_box_redaction(doc_id: str, req: AddManualBoxRedactionRequest):
         "entity_label": meta["label"],
         "exemption_code": req.exemption_code,
         "confidence": 1.0,
+        "score": 1.0,
         "detector": "Manual Drawn Box (PDF Canvas)",
         "enabled": True,
         "source": "manual",
         "comment": req.comment,
-        "page_number": req.page_number,
+        "page_number": page_num,
         "bboxes": [bbox],
     }
 
@@ -385,10 +509,11 @@ def add_manual_box_redaction(doc_id: str, req: AddManualBoxRedactionRequest):
 @app.post("/api/documents/{doc_id}/export")
 def export_redacted_document(doc_id: str, req: ExportRedactedRequest):
     doc_data = _get_doc_or_404(doc_id)
+    stamp = req.include_exemption_labels if req.include_exemption_labels is not None else req.include_exemption_stamp
     summary = processor.apply_final_redactions(
         doc_data=doc_data,
         redaction_style=req.redaction_style,
-        include_exemption_stamp=req.include_exemption_stamp,
+        include_exemption_stamp=stamp,
     )
     return summary
 
@@ -473,21 +598,63 @@ def _serialize_doc(doc_data: Dict[str, Any]) -> Dict[str, Any]:
 
     counts_by_type: Dict[str, int] = {}
     counts_by_exemption: Dict[str, int] = {}
+    for r in redactions:
+        # Ensure both `bboxes` and `rects` (with `page` alias) and `score`/`confidence` are present
+        bboxes = r.get("bboxes") or []
+        rects = []
+        for b in bboxes:
+            pno = b.get("page_number") or b.get("page") or r.get("page_number", 1)
+            b["page_number"] = pno
+            b["page"] = pno
+            rects.append({
+                "page": pno,
+                "page_number": pno,
+                "x0": b.get("x0", 0),
+                "y0": b.get("y0", 0),
+                "x1": b.get("x1", 0),
+                "y1": b.get("y1", 0),
+                "norm_x": b.get("norm_x", 0),
+                "norm_y": b.get("norm_y", 0),
+                "norm_w": b.get("norm_w", 0),
+                "norm_h": b.get("norm_h", 0),
+            })
+        r["rects"] = rects
+        if "score" not in r:
+            r["score"] = r.get("confidence", 0.9)
+        if "confidence" not in r:
+            r["confidence"] = r.get("score", 0.9)
+
     for r in enabled_redactions:
         et = r.get("entity_type", "CUSTOM")
         ex = r.get("exemption_code", "(b)(6)")
         counts_by_type[et] = counts_by_type.get(et, 0) + 1
         counts_by_exemption[ex] = counts_by_exemption.get(ex, 0) + 1
 
+    pages_list = doc_data.get("pages", [])
+    pages_meta = []
+    for p in pages_list:
+        pno = p.get("page_number") or p.get("page") or 1
+        p["page"] = pno
+        p["page_number"] = pno
+        pages_meta.append(p)
+
+    ext = Path(doc_data["filename"]).suffix.lower()
+    ocr_pages = [p["page_number"] for p in pages_meta if p.get("ocr_used")]
+
     return {
         "doc_id": doc_data["doc_id"],
         "filename": doc_data["filename"],
+        "ext": ext,
         "file_type": doc_data["file_type"],
+        "is_image_doc": doc_data.get("is_scanned_document", False),
         "is_scanned_document": doc_data.get("is_scanned_document", False),
+        "ocr_applied": doc_data.get("is_scanned_document", False) or len(ocr_pages) > 0,
+        "ocr_pages": ocr_pages,
         "ocr_pages_count": doc_data.get("ocr_pages_count", 0),
         "created_at": doc_data["created_at"],
         "page_count": doc_data["page_count"],
-        "pages": doc_data["pages"],
+        "pages": pages_meta,
+        "pages_meta": pages_meta,
         "full_text": doc_data["full_text"],
         "redactions": redactions,
         "stats": {
